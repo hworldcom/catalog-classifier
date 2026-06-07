@@ -1189,7 +1189,7 @@ GET /v1/local-batches/{batchId}/images/{imageId}
 GET /v1/local-batches/{batchId}/images/{imageId}/thumbnail
 ```
 
-Unknown batches and images return `404`. The read-only review route is:
+Unknown batches and images return `404`. The review route is:
 
 ```text
 /admin/review/{batchId}
