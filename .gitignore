@@ -11,5 +11,5 @@ htmlcov/
 node_modules/
 *.egg-info/
 *.pyc
-.AGENTS.md
+AGENTS.md
 tickets
