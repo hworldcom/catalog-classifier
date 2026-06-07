@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.env.local
+.next/
+.local-data/
+.pytest_cache/
+.venv/
+__pycache__/
+coverage/
+htmlcov/
+node_modules/
+*.egg-info/
+*.pyc
+.AGENTS.md
+tickets
