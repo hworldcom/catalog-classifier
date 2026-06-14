@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: catalog_classifier
+      POSTGRES_PASSWORD: catalog
+      POSTGRES_USER: catalog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catalog -d catalog_classifier"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    ports:
+      - "5432:5432"
+    volumes:
+      - catalog-postgres-data:/var/lib/postgresql/data
+
+volumes:
+  catalog-postgres-data:

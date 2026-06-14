@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
+from catalog_api.database import get_session
 from catalog_api.image_uploads import (
     MAX_FILES_PER_REQUEST,
     MAX_FILE_SIZE_BYTES,
@@ -23,6 +27,29 @@ from catalog_api.local_batches import (
     LocalBatchStore,
     LocalGroupNotFoundError,
     LocalImageNotFoundError,
+)
+from catalog_api.upload_batches import (
+    InvalidUploadMetadataError,
+    InvalidRetrySelectionError,
+    UploadBatchCreationError,
+    UploadBatchNotFoundError,
+    UploadBatchState,
+    UploadBatchStateError,
+    UploadFileMetadata,
+    UploadRegistrationError,
+    UploadRetryError,
+    create_upload_batch,
+    finalize_upload_batch,
+    get_upload_batch,
+    register_upload_files,
+    retry_failed_uploads,
+)
+from catalog_api.upload_storage import (
+    UploadObjectInspector,
+    UploadObjectInspectionError,
+    UploadUrlSigner,
+    get_upload_object_inspector,
+    get_upload_url_signer,
 )
 
 
@@ -42,6 +69,60 @@ class UploadHandshakeResponse(ApiModel):
     upload_id: UUID = Field(serialization_alias="uploadId")
     status: Literal["completed", "partial", "rejected"]
     files: list[UploadFileResult]
+
+
+class CreateUploadBatchResponse(ApiModel):
+    batch_id: UUID = Field(serialization_alias="batchId")
+    status: Literal["created"]
+    max_files: int = Field(serialization_alias="maxFiles")
+
+
+class RegisterUploadFileRequest(ApiModel):
+    original_filename: StrictStr = Field(alias="originalFilename")
+    mime_type: StrictStr = Field(alias="mimeType")
+    size_bytes: StrictInt = Field(alias="sizeBytes")
+
+
+class RegisterUploadsRequest(ApiModel):
+    files: list[RegisterUploadFileRequest]
+
+
+class RetryUploadsRequest(ApiModel):
+    image_ids: list[UUID] = Field(alias="imageIds")
+
+
+class RegisteredUploadResponse(ApiModel):
+    image_id: UUID = Field(serialization_alias="imageId")
+    upload_order: int = Field(serialization_alias="uploadOrder")
+    original_filename: str = Field(serialization_alias="originalFilename")
+    original_object_key: str = Field(serialization_alias="originalObjectKey")
+    upload_url: str = Field(serialization_alias="uploadUrl")
+
+
+class RegisterUploadsResponse(ApiModel):
+    batch_id: UUID = Field(serialization_alias="batchId")
+    status: Literal["uploading"]
+    uploads: list[RegisteredUploadResponse]
+
+
+class UploadBatchImageResponse(ApiModel):
+    image_id: UUID = Field(serialization_alias="imageId")
+    upload_order: int = Field(serialization_alias="uploadOrder")
+    original_filename: str = Field(serialization_alias="originalFilename")
+    status: str
+    error_code: str | None = Field(default=None, serialization_alias="errorCode")
+    error_message: str | None = Field(default=None, serialization_alias="errorMessage")
+
+
+class UploadBatchResponse(ApiModel):
+    batch_id: UUID = Field(serialization_alias="batchId")
+    status: str
+    original_file_count: int = Field(serialization_alias="originalFileCount")
+    processed_file_count: int = Field(serialization_alias="processedFileCount")
+    created_at: datetime = Field(serialization_alias="createdAt")
+    finalized_at: datetime | None = Field(serialization_alias="finalizedAt")
+    completed_at: datetime | None = Field(serialization_alias="completedAt")
+    images: list[UploadBatchImageResponse]
 
 
 class LocalBatchFileResult(ApiModel):
@@ -182,6 +263,292 @@ def _invalid_selection(message: str) -> HTTPException:
         status_code=status.HTTP_400_BAD_REQUEST,
         detail={"code": "invalid_selection", "message": message},
     )
+
+
+def _upload_batch_not_found() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "code": "batch_not_found",
+            "message": "Upload batch was not found.",
+        },
+    )
+
+
+def _upload_batch_state_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "invalid_batch_state",
+            "message": "Upload batch must be in uploading or queued state.",
+        },
+    )
+
+
+def _upload_batch_database_error(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "code": "database_error",
+            "message": message,
+        },
+    )
+
+
+def _upload_batch_finalization_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "code": "upload_finalization_failed",
+            "message": "Unable to finalize the upload batch.",
+        },
+    )
+
+
+def _invalid_retry_selection(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "code": "invalid_retry_selection",
+            "message": message,
+        },
+    )
+
+
+def _upload_retry_state_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "invalid_batch_state",
+            "message": "Upload retries require an uploading batch.",
+        },
+    )
+
+
+def _upload_retry_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "code": "upload_retry_failed",
+            "message": "Unable to prepare the selected upload retries.",
+        },
+    )
+
+
+def _upload_batch_response(snapshot: UploadBatchState) -> UploadBatchResponse:
+    return UploadBatchResponse(
+        batch_id=snapshot.batch_id,
+        status=snapshot.status,
+        original_file_count=snapshot.original_file_count,
+        processed_file_count=snapshot.processed_file_count,
+        created_at=snapshot.created_at,
+        finalized_at=snapshot.finalized_at,
+        completed_at=snapshot.completed_at,
+        images=[
+            UploadBatchImageResponse(
+                image_id=image.image_id,
+                upload_order=image.upload_order,
+                original_filename=image.original_filename,
+                status=image.status,
+                error_code=image.error_code,
+                error_message=image.error_message,
+            )
+            for image in snapshot.images
+        ],
+    )
+
+
+@app.post(
+    "/v1/upload-batches",
+    response_model=CreateUploadBatchResponse,
+    status_code=status.HTTP_200_OK,
+)
+def create_durable_upload_batch(
+    session: Annotated[Session, Depends(get_session)],
+) -> CreateUploadBatchResponse:
+    try:
+        batch = create_upload_batch(session)
+    except UploadBatchCreationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "code": "database_error",
+                "message": "Unable to create the upload batch.",
+            },
+        ) from error
+
+    return CreateUploadBatchResponse(
+        batch_id=batch.id,
+        status=batch.status,
+        max_files=MAX_FILES_PER_REQUEST,
+    )
+
+
+@app.post(
+    "/v1/upload-batches/{batch_id}/uploads",
+    response_model=RegisterUploadsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def register_durable_upload_files(
+    batch_id: UUID,
+    request: RegisterUploadsRequest,
+    session: Annotated[Session, Depends(get_session)],
+    signer: Annotated[UploadUrlSigner, Depends(get_upload_url_signer)],
+) -> RegisterUploadsResponse:
+    try:
+        registration = register_upload_files(
+            session,
+            batch_id=batch_id,
+            files=[
+                UploadFileMetadata(
+                    original_filename=file.original_filename,
+                    mime_type=file.mime_type,
+                    size_bytes=file.size_bytes,
+                )
+                for file in request.files
+            ],
+            signer=signer,
+        )
+    except InvalidUploadMetadataError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_upload_metadata", "message": str(error)},
+        ) from error
+    except UploadBatchNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "batch_not_found",
+                "message": "Upload batch was not found.",
+            },
+        ) from error
+    except UploadBatchStateError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "invalid_batch_state",
+                "message": "Upload batch must be in created state.",
+            },
+        ) from error
+    except UploadRegistrationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "code": "upload_registration_failed",
+                "message": "Unable to register files for upload.",
+            },
+        ) from error
+
+    return RegisterUploadsResponse(
+        batch_id=registration.batch_id,
+        status=registration.status,
+        uploads=[
+            RegisteredUploadResponse(
+                image_id=upload.image_id,
+                upload_order=upload.upload_order,
+                original_filename=upload.original_filename,
+                original_object_key=upload.original_object_key,
+                upload_url=upload.upload_url,
+            )
+            for upload in registration.uploads
+        ],
+    )
+
+
+@app.post(
+    "/v1/upload-batches/{batch_id}/retry-failed",
+    response_model=RegisterUploadsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def retry_durable_upload_files(
+    batch_id: UUID,
+    request: RetryUploadsRequest,
+    session: Annotated[Session, Depends(get_session)],
+    signer: Annotated[UploadUrlSigner, Depends(get_upload_url_signer)],
+) -> RegisterUploadsResponse:
+    try:
+        registration = retry_failed_uploads(
+            session,
+            batch_id=batch_id,
+            image_ids=request.image_ids,
+            signer=signer,
+        )
+    except InvalidRetrySelectionError as error:
+        raise _invalid_retry_selection(str(error)) from error
+    except UploadBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except UploadBatchStateError as error:
+        raise _upload_retry_state_error() from error
+    except UploadRetryError as error:
+        raise _upload_retry_error() from error
+
+    return RegisterUploadsResponse(
+        batch_id=registration.batch_id,
+        status=registration.status,
+        uploads=[
+            RegisteredUploadResponse(
+                image_id=upload.image_id,
+                upload_order=upload.upload_order,
+                original_filename=upload.original_filename,
+                original_object_key=upload.original_object_key,
+                upload_url=upload.upload_url,
+            )
+            for upload in registration.uploads
+        ],
+    )
+
+
+@app.post(
+    "/v1/upload-batches/{batch_id}/finalize",
+    response_model=UploadBatchResponse,
+    status_code=status.HTTP_200_OK,
+)
+def finalize_durable_upload_batch(
+    batch_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+    inspector: Annotated[UploadObjectInspector, Depends(get_upload_object_inspector)],
+) -> UploadBatchResponse:
+    try:
+        snapshot = finalize_upload_batch(
+            session,
+            batch_id=batch_id,
+            inspector=inspector,
+        )
+    except UploadBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except UploadBatchStateError as error:
+        raise _upload_batch_state_error() from error
+    except UploadObjectInspectionError as error:
+        session.rollback()
+        raise _upload_batch_finalization_error() from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to finalize the upload batch."
+        ) from error
+
+    return _upload_batch_response(snapshot)
+
+
+@app.get(
+    "/v1/upload-batches/{batch_id}",
+    response_model=UploadBatchResponse,
+)
+def get_durable_upload_batch(
+    batch_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> UploadBatchResponse:
+    try:
+        snapshot = get_upload_batch(session, batch_id=batch_id)
+    except UploadBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to load the upload batch."
+        ) from error
+
+    return _upload_batch_response(snapshot)
 
 
 @app.post(

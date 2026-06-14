@@ -185,7 +185,7 @@ catalog-classifier/
 ├── apps/
 │   └── web/                    # Next.js application
 ├── services/
-│   ├── api/                    # FastAPI HTTP API
+│   ├── api/                    # FastAPI HTTP API; see services/api/README.md
 │   └── worker/                 # Image-processing worker
 ├── packages/
 │   └── api-client/             # Generated TypeScript OpenAPI client
@@ -209,15 +209,19 @@ The frontend sends:
 POST /v1/upload-batches
 ```
 
-Example response:
+The API responds with `200 OK` and body:
 
 ```json
 {
   "batchId": "uuid",
   "status": "created",
-  "maxFiles": 200
+  "maxFiles": 20
 }
 ```
+
+Each request creates a durable `upload_batches` row under the seeded default
+organization. The database supplies the identifier, `created` status, zero counts, and
+timestamps. This endpoint does not register files or store image bytes.
 
 ### Step 2: Register files and obtain signed URLs
 
@@ -232,7 +236,20 @@ The API:
 1. Validates file count and file metadata.
 2. Creates an `image_asset` row for every file.
 3. Generates a unique object path.
-4. Returns one temporary signed upload URL per file.
+4. Returns one temporary signed `PUT` upload URL per file.
+
+The batch must still be in `created` state when registration starts. The request is
+all-or-nothing: if any file metadata is invalid, the registration fails and no rows
+are written. Successful registration transitions the batch to `uploading`, records
+the file count in `original_file_count`, keeps `processed_file_count` at zero, and
+leaves the image rows in `pending` while file transfers are still in progress.
+
+The signed upload URLs expire after 15 minutes.
+
+Registration is not idempotent. If a later request needs fresh signed URLs for the
+same uploaded image rows, a separate re-sign endpoint will handle that without
+creating new image rows. Retryable rows may move to a new object key during that
+flow so stale upload objects do not get reused.
 
 Object path format:
 
@@ -242,18 +259,26 @@ organizations/{organizationId}/batches/{batchId}/originals/{imageId}.jpg
 
 ### Step 3: Upload directly from browser to Cloud Storage
 
-The browser uploads each file directly to Cloud Storage.
+The ingest page implements the first reduced slice of this step: create a durable
+batch, register the selected JPEG metadata, upload each file directly to its signed
+`PUT` URL, and show uploaded or failed status per file.
 
-Requirements:
+Requirements for this reduced slice:
 
 * maximum four concurrent uploads;
-* individual progress indicators;
-* retry failed files independently;
-* do not restart successful uploads;
+* validate one to 20 JPEG files from 1 byte through 10 mebibytes before submission;
 * preserve original selection order;
-* allow the user to remove a file before processing starts.
+* match registered files by `uploadOrder` so duplicate filenames remain valid;
+* send `Content-Type: image/jpeg` with every signed `PUT` request;
+* show the durable batch identifier as soon as batch creation succeeds;
+* continue queued uploads when one upload fails;
+* leave failed or partially uploaded batches in `uploading` until a later recovery
+  flow exists;
+* do not finalize the batch or redirect to the local review page;
+* do not proxy the file bodies through Next.js or FastAPI.
 
-Do not proxy the file bodies through Next.js or FastAPI.
+Later upload-user-experience improvements such as percentage progress and
+remove-before-finalize behavior are intentionally deferred to later tickets.
 
 ### Step 4: Finalize the batch
 
@@ -263,9 +288,42 @@ After all intended uploads complete:
 POST /v1/upload-batches/{batchId}/finalize
 ```
 
-The backend confirms that the objects exist and enqueues processing tasks.
+The backend confirms that the objects exist, records per-image verification results,
+and marks the batch `queued` only after every image verifies. This slice does not
+create processing tasks yet; `queued` means verified and ready for future work.
+
+The same batch resource is also readable through:
+
+```http
+GET /v1/upload-batches/{batchId}
+```
+
+That readback returns the batch status, counts, timestamps, and images ordered by
+`uploadOrder`. If any image fails verification, the batch stays `uploading`, the
+failed images keep their error details, `finalized_at` and `completed_at` remain
+`null`, and repeated finalize on an already `queued` batch returns the current state
+without changing anything or re-checking storage.
 
 Repeated finalize requests must be idempotent.
+
+### Step 5: Re-sign retryable uploads
+
+When finalization leaves images in `pending` or `failed`, the backend can prepare a
+selected subset for another direct browser upload:
+
+```http
+POST /v1/upload-batches/{batchId}/retry-failed
+```
+
+The batch must still be `uploading`. The backend locks the batch and selected image
+rows, rejects non-retryable selections, assigns each selected row a new object key,
+and returns fresh signed `PUT` URLs in `uploadOrder`. Image statuses and error details
+remain unchanged until finalization runs again.
+
+Each retry uses a new UUID-based object path so the API service account does not need
+permission to overwrite existing objects. Signing and object-key updates are
+all-or-nothing. Objects from earlier attempts are intentionally retained until the
+later stale-object cleanup slice.
 
 ---
 
@@ -929,6 +987,55 @@ Required controls:
 
 The client-provided filename must never be used directly as a storage path.
 
+## 14.1 Google Cloud upload foundation
+
+The direct browser upload path depends on a small amount of manual Google Cloud setup
+in the development project:
+
+* Create a private Cloud Storage bucket for ingestion objects. The current local
+  development bucket is `gs://lnlabs-bucket`.
+* Keep public access prevention and uniform bucket-level access enabled so uploaded
+  objects stay private.
+* Configure bucket CORS for origins `http://localhost:3000` and
+  `http://127.0.0.1:3000`, method `PUT`, and request header `Content-Type` so the
+  browser can send direct signed upload requests from the local Next.js frontend.
+* Create a dedicated API service account. The current one is
+  `catalog-api@catalog-classifier.iam.gserviceaccount.com`.
+* Grant that service account `roles/storage.objectCreator` on the bucket so the
+  backend can write upload objects through signed URLs.
+* Grant that service account `roles/storage.objectViewer` on the bucket so the
+  backend can verify uploaded objects during finalization.
+* Enable the Service Account Credentials API.
+* Grant the local signing principal `roles/iam.serviceAccountTokenCreator` on the API
+  service account so it can impersonate that account and call
+  `iam.serviceAccounts.signBlob`.
+
+This setup exists for the upload foundation work in ticket `0006`. The bucket stays
+private, the browser never receives broad bucket access, and the API remains the only
+component that can mint upload URLs.
+
+The API process must receive the upload configuration in its environment. For local
+development, set the values in the same terminal before starting the API:
+
+```bash
+export CATALOG_UPLOAD_BUCKET=lnlabs-bucket
+export CATALOG_SIGNING_SERVICE_ACCOUNT="catalog-api@catalog-classifier.iam.gserviceaccount.com"
+.venv/bin/uvicorn catalog_api.main:app --reload --port 8000
+```
+
+Restart the API after adding or changing these values because the running process does
+not inherit later shell changes. If the bucket configuration or signing credentials
+are unavailable, file registration returns `500` with code
+`upload_registration_failed`. The database transaction is rolled back, so the batch
+remains `created` and no image rows are retained.
+
+A successful registration creates image metadata and returns signed URLs; it does not
+upload image bytes. An object appears in Cloud Storage only after the client sends the
+file in a separate signed `PUT` request.
+
+If the frontend origin changes, add the new origin to bucket CORS and to
+`CATALOG_WEB_ORIGINS` in the API service.
+
 ---
 
 ## 15. Observability
@@ -1276,10 +1383,30 @@ Keep the first milestone small and vertical. A practical order is:
 3. Create the file registration endpoint and signed upload URL generation.
 4. Build the drag-and-drop upload screen with local previews.
 5. Support direct browser upload to cloud storage.
-6. Show per-file progress, retry, and remove-before-finalize behavior.
-7. Implement finalize and batch status retrieval.
-8. Persist uploaded file metadata and preserve selection order.
-9. Add tests for upload validation, idempotent finalize behavior, and batch reload.
+6. Implement finalize and batch status retrieval.
+7. Re-sign missing or failed uploads.
+8. Add inline frontend retry without re-uploading successful files.
+9. Add remove-before-finalize behavior and stale-batch cleanup.
+
+Each slice in the sequence should include focused tests in its ticket; testing is part
+of the slice, not a separate milestone.
+
+#### Upload database foundation
+
+The first Milestone 1 slice introduces PostgreSQL metadata persistence without changing
+the existing local filesystem proof of concept. It adds:
+
+* `organizations`, `upload_batches`, and `image_assets` tables;
+* organization-scoped foreign keys and uniqueness constraints;
+* ordered image registration within a batch;
+* explicit batch and image lifecycle constraints;
+* a stable default organization for local development;
+* SQLAlchemy models and Alembic migrations;
+* a PostgreSQL 16 service for local migration validation.
+
+Image bytes and thumbnails remain outside PostgreSQL. The detailed schema contract,
+engineering decisions, migration commands, and validation workflow are maintained in
+[`services/api/README.md`](services/api/README.md).
 
 ### Milestone 2: Per-image processing
 

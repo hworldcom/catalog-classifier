@@ -8,9 +8,14 @@ version = "0.1.0"
 description = "Backend API for the catalog image classification tool"
 requires-python = ">=3.12"
 dependencies = [
+  "alembic>=1.16,<2",
   "fastapi>=0.136.3,<0.137",
+  "google-auth>=2.38,<3",
+  "google-cloud-storage>=3.1,<4",
   "pillow>=12.2,<13",
+  "psycopg[binary]>=3.2,<4",
   "python-multipart>=0.0.20,<0.1",
+  "sqlalchemy>=2.0,<3",
   "uvicorn[standard]>=0.34,<1",
 ]
 
@@ -22,7 +27,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "postgresql: requires a PostgreSQL server",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

@@ -129,6 +129,11 @@ button:disabled {
   background: var(--success);
 }
 
+.message.batch-created,
+.message.uploading {
+  background: #e5edf5;
+}
+
 .message.partial {
   background: var(--warning);
 }
@@ -175,7 +180,20 @@ button:disabled {
   color: #0b6447;
 }
 
+.file-status.uploaded {
+  color: #0b6447;
+}
+
+.file-status.pending,
+.file-status.uploading {
+  color: #4d5f75;
+}
+
 .file-status.rejected {
+  color: #8d2525;
+}
+
+.file-status.failed {
   color: #8d2525;
 }
 

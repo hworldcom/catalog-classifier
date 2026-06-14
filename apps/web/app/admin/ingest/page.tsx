@@ -1,20 +1,38 @@
 "use client";
 
 import { ChangeEvent, FormEvent, useState } from "react";
-import { useRouter } from "next/navigation";
 
 import {
-  CreateLocalBatchResult,
-  MAX_FILES_PER_REQUEST,
-  createLocalBatch,
-} from "@/lib/local-batches";
+  DirectUpload,
+  createUploadBatch,
+  prepareDirectUploads,
+  registerUploadFiles,
+  uploadDirectFiles,
+  validateUploadFiles,
+} from "@/lib/durable-uploads";
 
 export default function UploadPage() {
-  const router = useRouter();
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
-  const [result, setResult] = useState<CreateLocalBatchResult | null>(null);
+  const [batchId, setBatchId] = useState<string | null>(null);
+  const [uploads, setUploads] = useState<DirectUpload[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const uploadedCount =
+    uploads?.filter((upload) => upload.status === "uploaded").length ?? 0;
+  const failedCount =
+    uploads?.filter((upload) => upload.status === "failed").length ?? 0;
+  const uploadAttemptsFinished =
+    uploads !== null &&
+    uploads.every(
+      (upload) => upload.status === "uploaded" || upload.status === "failed",
+    );
+  const resultClass = !uploadAttemptsFinished
+    ? "uploading"
+    : failedCount === 0
+      ? "completed"
+      : uploadedCount === 0
+        ? "rejected"
+        : "partial";
   const uploadButtonLabel =
     selectedFiles.length === 0
       ? "Upload images"
@@ -25,39 +43,52 @@ export default function UploadPage() {
   function handleFileSelection(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []);
     setSelectedFiles(files);
-    setResult(null);
-
-    if (files.length > MAX_FILES_PER_REQUEST) {
-      setError(`Select at most ${MAX_FILES_PER_REQUEST} JPEG files.`);
-    } else {
-      setError(null);
-    }
+    setBatchId(null);
+    setUploads(null);
+    setError(files.length === 0 ? null : validateUploadFiles(files));
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (selectedFiles.length === 0) {
-      setError("Select at least one JPEG file.");
-      return;
-    }
-
-    if (selectedFiles.length > MAX_FILES_PER_REQUEST) {
-      setError(`Select at most ${MAX_FILES_PER_REQUEST} JPEG files.`);
+    const validationError = validateUploadFiles(selectedFiles);
+    if (validationError) {
+      setError(validationError);
       return;
     }
 
     setIsUploading(true);
     setError(null);
-    setResult(null);
+    setBatchId(null);
+    setUploads(null);
 
     try {
-      const batchResult = await createLocalBatch(selectedFiles);
-      if (batchResult.batchId) {
-        router.push(`/admin/review/${batchResult.batchId}`);
-      } else {
-        setResult(batchResult);
-      }
+      const batch = await createUploadBatch();
+      setBatchId(batch.batchId);
+
+      const registration = await registerUploadFiles(
+        batch.batchId,
+        selectedFiles,
+      );
+      const pendingUploads = prepareDirectUploads(
+        selectedFiles,
+        registration.uploads,
+      );
+      setUploads(pendingUploads);
+
+      const completedUploads = await uploadDirectFiles(
+        pendingUploads,
+        (updatedUpload) => {
+          setUploads((currentUploads) =>
+            currentUploads?.map((upload) =>
+              upload.uploadOrder === updatedUpload.uploadOrder
+                ? updatedUpload
+                : upload,
+            ) ?? null,
+          );
+        },
+      );
+      setUploads(completedUploads);
     } catch (uploadError) {
       setError(
         uploadError instanceof Error
@@ -76,8 +107,8 @@ export default function UploadPage() {
         <h1 id="upload-heading">Upload JPEG images</h1>
         <p className="intro">
           Select up to 20 files. Each file may be no larger than 10 mebibytes.
-          Accepted files are stored locally and grouped only when their original
-          bytes are identical.
+          Files are registered in a durable batch and uploaded directly to
+          private cloud storage.
         </p>
 
         <form onSubmit={handleSubmit} className="upload-form">
@@ -88,6 +119,7 @@ export default function UploadPage() {
               accept=".jpg,.jpeg,image/jpeg"
               multiple
               onChange={handleFileSelection}
+              disabled={isUploading}
             />
           </label>
 
@@ -113,22 +145,34 @@ export default function UploadPage() {
           </div>
         ) : null}
 
-        {result ? (
+        {batchId ? (
+          <section className="message batch-created" aria-live="polite">
+            <strong>Durable upload batch</strong>
+            <span className="upload-id">{batchId}</span>
+          </section>
+        ) : null}
+
+        {uploads ? (
           <section
-            className={`message ${result.status}`}
+            className={`message ${resultClass}`}
             aria-live="polite"
             aria-label="Upload result"
-            role="alert"
           >
-            <strong>The backend rejected every selected file.</strong>
+            <strong>
+              {uploadAttemptsFinished
+                ? `${uploadedCount} uploaded, ${failedCount} failed.`
+                : "Uploading files..."}
+            </strong>
             <ul className="file-results">
-              {result.files.map((file, index) => (
-                <li key={`${file.originalFilename}-${index}`}>
-                  <span>{file.originalFilename}</span>
-                  <span className={`file-status ${file.status}`}>
-                    {file.status}
+              {uploads.map((upload) => (
+                <li key={upload.imageId}>
+                  <span>{upload.originalFilename}</span>
+                  <span className={`file-status ${upload.status}`}>
+                    {upload.status}
                   </span>
-                  {file.errorMessage ? <small>{file.errorMessage}</small> : null}
+                  {upload.errorMessage ? (
+                    <small>{upload.errorMessage}</small>
+                  ) : null}
                 </li>
               ))}
             </ul>
