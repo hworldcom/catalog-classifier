@@ -22,6 +22,26 @@ export type RegisterUploadsResult = {
   uploads: RegisteredUpload[];
 };
 
+export type UploadBatchImage = {
+  imageId: string;
+  uploadOrder: number;
+  originalFilename: string;
+  status: string;
+  errorCode: string | null;
+  errorMessage: string | null;
+};
+
+export type UploadBatchResult = {
+  batchId: string;
+  status: string;
+  originalFileCount: number;
+  processedFileCount: number;
+  createdAt: string;
+  finalizedAt: string | null;
+  completedAt: string | null;
+  images: UploadBatchImage[];
+};
+
 export type DirectUploadStatus =
   | "pending"
   | "uploading"
@@ -30,6 +50,15 @@ export type DirectUploadStatus =
 
 export type DirectUpload = RegisteredUpload & {
   file: File;
+  status: DirectUploadStatus;
+  errorMessage: string | null;
+};
+
+export type UploadSessionRow = {
+  imageId: string;
+  uploadOrder: number;
+  originalFilename: string;
+  file: File | null;
   status: DirectUploadStatus;
   errorMessage: string | null;
 };
@@ -130,6 +159,61 @@ export async function registerUploadFiles(
   return (await response.json()) as RegisterUploadsResult;
 }
 
+export async function loadUploadBatch(
+  batchId: string,
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<UploadBatchResult> {
+  const response = await fetchImplementation(
+    apiUrl(`/v1/upload-batches/${batchId}`, baseUrl),
+  );
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as UploadBatchResult;
+}
+
+export async function finalizeUploadBatch(
+  batchId: string,
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<UploadBatchResult> {
+  const response = await fetchImplementation(
+    apiUrl(`/v1/upload-batches/${batchId}/finalize`, baseUrl),
+    { method: "POST" },
+  );
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as UploadBatchResult;
+}
+
+export async function requestRetryUploads(
+  batchId: string,
+  imageIds: string[],
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<RegisterUploadsResult> {
+  const response = await fetchImplementation(
+    apiUrl(`/v1/upload-batches/${batchId}/retry-failed`, baseUrl),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ imageIds }),
+    },
+  );
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as RegisterUploadsResult;
+}
+
 export function prepareDirectUploads(
   files: File[],
   registeredUploads: RegisteredUpload[],
@@ -159,6 +243,150 @@ export function prepareDirectUploads(
     status: "pending",
     errorMessage: null,
   }));
+}
+
+export function toUploadSessionRows(
+  uploads: DirectUpload[],
+): UploadSessionRow[] {
+  return uploads.map((upload) => ({
+    imageId: upload.imageId,
+    uploadOrder: upload.uploadOrder,
+    originalFilename: upload.originalFilename,
+    file: upload.file,
+    status: upload.status,
+    errorMessage: upload.errorMessage,
+  }));
+}
+
+export function isRetryableUpload(row: UploadSessionRow): boolean {
+  return (
+    row.file !== null && (row.status === "pending" || row.status === "failed")
+  );
+}
+
+export function reconcileUploadSessionRows(
+  currentRows: UploadSessionRow[],
+  batch: UploadBatchResult,
+): UploadSessionRow[] {
+  const currentRowsById = new Map(
+    currentRows.map((row) => [row.imageId, row]),
+  );
+  const backendImageIds = new Set<string>();
+
+  const reconciledRows = [...batch.images]
+    .sort((left, right) => left.uploadOrder - right.uploadOrder)
+    .map((image) => {
+      if (backendImageIds.has(image.imageId)) {
+        throw new DurableUploadError(
+          "The backend returned invalid upload batch data.",
+        );
+      }
+      backendImageIds.add(image.imageId);
+
+      const currentRow = currentRowsById.get(image.imageId);
+      if (!currentRow) {
+        return {
+          imageId: image.imageId,
+          uploadOrder: image.uploadOrder,
+          originalFilename: image.originalFilename,
+          file: null,
+          status: persistedStatusForDisplay(image.status),
+          errorMessage: image.errorMessage,
+        };
+      }
+
+      if (image.status === "uploaded") {
+        return {
+          ...currentRow,
+          uploadOrder: image.uploadOrder,
+          originalFilename: image.originalFilename,
+          status: "uploaded" as const,
+          errorMessage: null,
+        };
+      }
+
+      if (image.status === "failed") {
+        return {
+          ...currentRow,
+          uploadOrder: image.uploadOrder,
+          originalFilename: image.originalFilename,
+          status: "failed" as const,
+          errorMessage: image.errorMessage,
+        };
+      }
+
+      if (image.status !== "pending") {
+        return {
+          ...currentRow,
+          uploadOrder: image.uploadOrder,
+          originalFilename: image.originalFilename,
+          status: "uploaded" as const,
+          errorMessage: null,
+        };
+      }
+
+      return {
+        ...currentRow,
+        uploadOrder: image.uploadOrder,
+        originalFilename: image.originalFilename,
+      };
+    });
+
+  if (currentRows.some((row) => !backendImageIds.has(row.imageId))) {
+    throw new DurableUploadError(
+      "The backend returned invalid upload batch data.",
+    );
+  }
+
+  return reconciledRows;
+}
+
+export function prepareRetryUploads(
+  rows: UploadSessionRow[],
+  selectedImageIds: string[],
+  registeredUploads: RegisteredUpload[],
+): DirectUpload[] {
+  const selectedIdSet = new Set(selectedImageIds);
+  const registeredById = new Map<string, RegisteredUpload>();
+
+  if (
+    selectedIdSet.size !== selectedImageIds.length ||
+    registeredUploads.length !== selectedImageIds.length
+  ) {
+    throw new DurableUploadError(
+      "The backend returned invalid upload retry data.",
+    );
+  }
+
+  for (const upload of registeredUploads) {
+    if (
+      !selectedIdSet.has(upload.imageId) ||
+      registeredById.has(upload.imageId)
+    ) {
+      throw new DurableUploadError(
+        "The backend returned invalid upload retry data.",
+      );
+    }
+    registeredById.set(upload.imageId, upload);
+  }
+
+  const rowsById = new Map(rows.map((row) => [row.imageId, row]));
+  return selectedImageIds.map((imageId) => {
+    const row = rowsById.get(imageId);
+    const registration = registeredById.get(imageId);
+    if (!row?.file || !registration || !isRetryableUpload(row)) {
+      throw new DurableUploadError(
+        "The backend returned invalid upload retry data.",
+      );
+    }
+
+    return {
+      ...registration,
+      file: row.file,
+      status: "pending",
+      errorMessage: null,
+    };
+  });
 }
 
 export async function uploadDirectFiles(
@@ -219,4 +447,11 @@ export async function uploadDirectFiles(
   );
 
   return results;
+}
+
+function persistedStatusForDisplay(status: string): DirectUploadStatus {
+  if (status === "uploaded" || status === "failed" || status === "pending") {
+    return status;
+  }
+  return "uploaded";
 }

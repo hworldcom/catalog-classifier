@@ -5,8 +5,15 @@ import {
   MAX_CONCURRENT_UPLOADS,
   MAX_FILE_SIZE_BYTES,
   createUploadBatch,
+  finalizeUploadBatch,
+  isRetryableUpload,
+  loadUploadBatch,
   prepareDirectUploads,
+  prepareRetryUploads,
+  reconcileUploadSessionRows,
   registerUploadFiles,
+  requestRetryUploads,
+  toUploadSessionRows,
   uploadDirectFiles,
   validateUploadFiles,
 } from "@/lib/durable-uploads";
@@ -25,6 +32,21 @@ function registeredUpload(uploadOrder: number, filename: string) {
     originalFilename: filename,
     originalObjectKey: `objects/image-${uploadOrder}.jpg`,
     uploadUrl: `https://uploads.example.test/image-${uploadOrder}`,
+  };
+}
+
+function batchImage(
+  uploadOrder: number,
+  status: string,
+  errorMessage: string | null = null,
+) {
+  return {
+    imageId: `image-${uploadOrder}`,
+    uploadOrder,
+    originalFilename: `image-${uploadOrder}.jpg`,
+    status,
+    errorCode: errorMessage ? "upload_error" : null,
+    errorMessage,
   };
 }
 
@@ -162,6 +184,111 @@ describe("durable upload client", () => {
     );
   });
 
+  it("loads durable batch state and requests retry URLs in caller order", async () => {
+    const batchBody = {
+      batchId: "batch-1",
+      status: "uploading",
+      originalFileCount: 2,
+      processedFileCount: 0,
+      createdAt: "2026-06-14T12:00:00Z",
+      finalizedAt: null,
+      completedAt: null,
+      images: [batchImage(0, "pending"), batchImage(1, "failed")],
+    };
+    const retryBody = {
+      batchId: "batch-1",
+      status: "uploading",
+      uploads: [
+        registeredUpload(0, "image-0.jpg"),
+        registeredUpload(1, "image-1.jpg"),
+      ],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(batchBody))
+      .mockResolvedValueOnce(jsonResponse(retryBody));
+
+    await expect(
+      loadUploadBatch(
+        "batch-1",
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(batchBody);
+    await expect(
+      requestRetryUploads(
+        "batch-1",
+        ["image-0", "image-1"],
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(retryBody);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://api.example.test/v1/upload-batches/batch-1",
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://api.example.test/v1/upload-batches/batch-1/retry-failed",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageIds: ["image-0", "image-1"] }),
+      },
+    );
+  });
+
+  it("finalizes durable batch state and surfaces backend errors", async () => {
+    const finalizedBody = {
+      batchId: "batch-1",
+      status: "queued",
+      originalFileCount: 1,
+      processedFileCount: 0,
+      createdAt: "2026-06-14T12:00:00Z",
+      finalizedAt: "2026-06-14T12:01:00Z",
+      completedAt: null,
+      images: [batchImage(0, "uploaded")],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(finalizedBody))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            detail: {
+              code: "upload_finalization_failed",
+              message: "Unable to finalize the upload batch.",
+            },
+          },
+          500,
+        ),
+      );
+
+    await expect(
+      finalizeUploadBatch(
+        "batch-1",
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(finalizedBody);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://api.example.test/v1/upload-batches/batch-1/finalize",
+      { method: "POST" },
+    );
+
+    await expect(
+      finalizeUploadBatch(
+        "batch-1",
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).rejects.toEqual(
+      new DurableUploadError("Unable to finalize the upload batch."),
+    );
+  });
+
   it("matches duplicate filenames to registrations by upload order", () => {
     const firstFile = new File(["first"], "product.jpg", {
       type: "image/jpeg",
@@ -204,6 +331,143 @@ describe("durable upload client", () => {
         registeredUpload(0, "second.jpg"),
       ]),
     ).toThrow("The backend returned invalid upload registration data.");
+  });
+
+  it("reconciles durable and local states without retrying local successes", () => {
+    const files = [
+      new File(["first"], "image-0.jpg", { type: "image/jpeg" }),
+      new File(["second"], "image-1.jpg", { type: "image/jpeg" }),
+      new File(["third"], "image-2.jpg", { type: "image/jpeg" }),
+    ];
+    const rows = toUploadSessionRows(
+      prepareDirectUploads(
+        files,
+        files.map((file, index) => registeredUpload(index, file.name)),
+      ),
+    ).map((row, index) => ({
+      ...row,
+      status: index === 0 ? ("uploaded" as const) : ("failed" as const),
+      errorMessage: index === 0 ? null : "Network unavailable.",
+    }));
+
+    const reconciled = reconcileUploadSessionRows(rows, {
+      batchId: "batch-1",
+      status: "uploading",
+      originalFileCount: 4,
+      processedFileCount: 0,
+      createdAt: "2026-06-14T12:00:00Z",
+      finalizedAt: null,
+      completedAt: null,
+      images: [
+        batchImage(0, "pending"),
+        batchImage(1, "pending"),
+        batchImage(2, "failed", "Stored object has the wrong size."),
+        {
+          ...batchImage(3, "pending"),
+          imageId: "image-without-file",
+          originalFilename: "missing-local-file.jpg",
+        },
+      ],
+    });
+
+    expect(reconciled.map((row) => row.status)).toEqual([
+      "uploaded",
+      "failed",
+      "failed",
+      "pending",
+    ]);
+    expect(reconciled[1].errorMessage).toBe("Network unavailable.");
+    expect(reconciled[2].errorMessage).toBe(
+      "Stored object has the wrong size.",
+    );
+    expect(reconciled[3].file).toBeNull();
+    expect(reconciled.map(isRetryableUpload)).toEqual([
+      false,
+      true,
+      true,
+      false,
+    ]);
+  });
+
+  it("treats durable uploaded state as authoritative", () => {
+    const file = new File(["image"], "image-0.jpg", { type: "image/jpeg" });
+    const rows = toUploadSessionRows(
+      prepareDirectUploads([file], [registeredUpload(0, file.name)]),
+    ).map((row) => ({
+      ...row,
+      status: "failed" as const,
+      errorMessage: "Network unavailable.",
+    }));
+
+    const [reconciled] = reconcileUploadSessionRows(rows, {
+      batchId: "batch-1",
+      status: "queued",
+      originalFileCount: 1,
+      processedFileCount: 0,
+      createdAt: "2026-06-14T12:00:00Z",
+      finalizedAt: "2026-06-14T12:01:00Z",
+      completedAt: null,
+      images: [batchImage(0, "uploaded")],
+    });
+
+    expect(reconciled.status).toBe("uploaded");
+    expect(reconciled.errorMessage).toBeNull();
+    expect(isRetryableUpload(reconciled)).toBe(false);
+  });
+
+  it("prepares retries by image identifier and rejects invalid responses", () => {
+    const files = [
+      new File(["first"], "image-0.jpg", { type: "image/jpeg" }),
+      new File(["second"], "image-1.jpg", { type: "image/jpeg" }),
+    ];
+    const rows = toUploadSessionRows(
+      prepareDirectUploads(
+        files,
+        files.map((file, index) => registeredUpload(index, file.name)),
+      ),
+    ).map((row) => ({
+      ...row,
+      status: "failed" as const,
+      errorMessage: "Upload failed.",
+    }));
+    const retryRegistrations = [
+      {
+        ...registeredUpload(1, "image-1.jpg"),
+        uploadUrl: "https://uploads.example.test/retry-1",
+      },
+      {
+        ...registeredUpload(0, "image-0.jpg"),
+        uploadUrl: "https://uploads.example.test/retry-0",
+      },
+    ];
+
+    const retries = prepareRetryUploads(
+      rows,
+      ["image-0", "image-1"],
+      retryRegistrations,
+    );
+
+    expect(retries.map((upload) => upload.imageId)).toEqual([
+      "image-0",
+      "image-1",
+    ]);
+    expect(retries.map((upload) => upload.file)).toEqual(files);
+    expect(retries.map((upload) => upload.status)).toEqual([
+      "pending",
+      "pending",
+    ]);
+
+    expect(() =>
+      prepareRetryUploads(rows, ["image-0", "image-1"], [
+        retryRegistrations[0],
+      ]),
+    ).toThrow("The backend returned invalid upload retry data.");
+    expect(() =>
+      prepareRetryUploads(rows, ["image-0", "image-1"], [
+        retryRegistrations[0],
+        retryRegistrations[0],
+      ]),
+    ).toThrow("The backend returned invalid upload retry data.");
   });
 
   it("limits uploads to four workers and continues after failures", async () => {

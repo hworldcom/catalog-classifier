@@ -13,6 +13,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from catalog_api.database import get_session
+from catalog_api.image_embedding_providers import (
+    ImageEmbeddingProvider,
+    get_image_embedding_provider,
+)
 from catalog_api.image_uploads import (
     MAX_FILES_PER_REQUEST,
     MAX_FILE_SIZE_BYTES,
@@ -28,6 +32,13 @@ from catalog_api.local_batches import (
     LocalGroupNotFoundError,
     LocalImageNotFoundError,
 )
+from catalog_api.processing_jobs import (
+    ProcessImageTaskPayload,
+    ProcessingJobExecutionError,
+    ProcessingJobNotFoundError,
+    process_image_task,
+)
+from catalog_api.processing_storage import WorkerStorage, get_worker_storage
 from catalog_api.upload_batches import (
     InvalidUploadMetadataError,
     InvalidRetrySelectionError,
@@ -89,6 +100,20 @@ class RegisterUploadsRequest(ApiModel):
 
 class RetryUploadsRequest(ApiModel):
     image_ids: list[UUID] = Field(alias="imageIds")
+
+
+class ProcessImageTaskRequest(ApiModel):
+    batch_id: UUID = Field(alias="batchId")
+    image_id: UUID = Field(alias="imageId")
+    pipeline_version: StrictStr = Field(alias="pipelineVersion")
+
+
+class ProcessImageTaskResponse(ApiModel):
+    batch_id: UUID = Field(serialization_alias="batchId")
+    image_id: UUID = Field(serialization_alias="imageId")
+    pipeline_version: str = Field(serialization_alias="pipelineVersion")
+    job_status: str = Field(serialization_alias="jobStatus")
+    did_work: bool = Field(serialization_alias="didWork")
 
 
 class RegisteredUploadResponse(ApiModel):
@@ -335,6 +360,30 @@ def _upload_retry_error() -> HTTPException:
     )
 
 
+def _processing_job_not_found() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "code": "processing_job_not_found",
+            "message": "Processing job was not found.",
+        },
+    )
+
+
+def _processing_job_error(
+    *,
+    code: str = "processing_job_failed",
+    message: str = "Unable to process the image job.",
+) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "code": code,
+            "message": message,
+        },
+    )
+
+
 def _upload_batch_response(snapshot: UploadBatchState) -> UploadBatchResponse:
     return UploadBatchResponse(
         batch_id=snapshot.batch_id,
@@ -528,6 +577,54 @@ def finalize_durable_upload_batch(
         ) from error
 
     return _upload_batch_response(snapshot)
+
+
+@app.post(
+    "/internal/tasks/process-image",
+    response_model=ProcessImageTaskResponse,
+    status_code=status.HTTP_200_OK,
+)
+def process_image_worker_task(
+    request: ProcessImageTaskRequest,
+    session: Annotated[Session, Depends(get_session)],
+    storage_client: Annotated[WorkerStorage, Depends(get_worker_storage)],
+    embedding_provider: Annotated[
+        ImageEmbeddingProvider,
+        Depends(get_image_embedding_provider),
+    ],
+) -> ProcessImageTaskResponse:
+    try:
+        result = process_image_task(
+            session,
+            payload=ProcessImageTaskPayload(
+                batch_id=request.batch_id,
+                image_id=request.image_id,
+                pipeline_version=request.pipeline_version,
+            ),
+            storage=storage_client,
+            embedding_provider=embedding_provider,
+        )
+    except ProcessingJobNotFoundError as error:
+        raise _processing_job_not_found() from error
+    except ProcessingJobExecutionError as error:
+        raise _processing_job_error(
+            code=error.error_code,
+            message=error.message,
+        ) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _processing_job_error(
+            code="database_error",
+            message="Unable to persist the image processing result.",
+        ) from error
+
+    return ProcessImageTaskResponse(
+        batch_id=result.batch_id,
+        image_id=result.image_id,
+        pipeline_version=result.pipeline_version,
+        job_status=result.job_status,
+        did_work=result.did_work,
+    )
 
 
 @app.get(

@@ -86,8 +86,11 @@ but setting it explicitly makes the active identity clear.
 
 ## Database Foundation
 
-PostgreSQL 16 is the supported local database. SQLAlchemy 2 defines the application
-models and Alembic owns schema migration history.
+PostgreSQL 16 with the pgvector extension is the supported local database.
+SQLAlchemy 2 defines the application models and Alembic owns schema migration
+history. The local Compose service uses `pgvector/pgvector:pg16` so the
+database image has the `vector` extension files available. Migration
+`0004_pgvector_foundation` enables the extension in each database.
 
 ### Type decisions
 
@@ -141,6 +144,8 @@ reference a batch without crossing organization boundaries.
 | `organization_id` | `uuid` | no | none |
 | `batch_id` | `uuid` | no | none |
 | `original_object_key` | `text` | no | none |
+| `normalized_object_key` | `text` | yes | none |
+| `inference_object_key` | `text` | yes | none |
 | `thumbnail_object_key` | `text` | yes | none |
 | `original_filename` | `text` | no | none |
 | `upload_order` | `integer` | no | none |
@@ -148,7 +153,11 @@ reference a batch without crossing organization boundaries.
 | `size_bytes` | `bigint` | no | none |
 | `width` | `integer` | yes | none |
 | `height` | `integer` | yes | none |
+| `normalized_format` | `varchar(32)` | yes | none |
+| `normalized_size_bytes` | `bigint` | yes | none |
 | `sha256` | `varchar(64)` | yes | none |
+| `phash` | `varchar(16)` | yes | none |
+| `dhash` | `varchar(16)` | yes | none |
 | `status` | `varchar(32)` | no | `pending` |
 | `error_code` | `varchar(100)` | yes | none |
 | `error_message` | `text` | yes | none |
@@ -156,6 +165,14 @@ reference a batch without crossing organization boundaries.
 
 Allowed statuses are `pending`, `uploaded`, `processing`, `processed`, and `failed`.
 File size, upload order, and dimensions cannot be negative.
+
+`size_bytes` remains the original uploaded file size from registration. The
+normalized image uses the new `normalized_format` and `normalized_size_bytes`
+fields, while `width` and `height` describe the normalized image after EXIF
+orientation and conversion.
+
+`phash` and `dhash` are stored as lowercase 16-character hexadecimal strings
+derived from the normalized image.
 
 The schema enforces:
 
@@ -167,6 +184,133 @@ The schema enforces:
 
 The ordered batch query is supported by the unique index backing
 `(organization_id, batch_id, upload_order)`.
+
+### `processing_jobs`
+
+```text
+id
+organization_id
+batch_id
+image_id nullable
+job_type
+status
+attempt_count
+pipeline_version
+created_at
+started_at
+completed_at
+error_message
+idempotency_key
+```
+
+Processing jobs use the statuses `pending`, `started`, `completed`, and `failed`.
+
+The schema enforces:
+
+- unique `idempotency_key`;
+- organization-scoped foreign keys;
+- nullable `image_id` for future batch-level jobs, while this prototype creates
+  image-scoped jobs only.
+
+### `image_embeddings`
+
+```text
+id
+organization_id
+image_id
+provider
+model
+dimensions
+pipeline_version
+embedding vector(768)
+created_at
+```
+
+The schema enforces one embedding row per organization, image, and pipeline
+version.
+The embedding row uses an organization-scoped foreign key from
+`(organization_id, image_id)` to the image row.
+This table requires the PostgreSQL pgvector extension and the matching vector
+column type support. Application code should use
+`catalog_api.embedding_vectors.image_embedding_vector_type()` for the
+`vector(768)` column type so the embedding dimension stays centralized.
+
+## Processing Foundation
+
+Ticket `0011` keeps processing local and explicit. Finalization still returns a
+`queued` batch. A separate internal service function claims the queued batch, moves
+it to `processing`, creates one `process-image` processing job per image, and sends
+identifier-only payloads to a local queue adapter.
+
+The local worker entrypoint is:
+
+```http
+POST /internal/tasks/process-image
+```
+
+```json
+{
+  "batchId": "uuid",
+  "imageId": "uuid",
+  "pipelineVersion": "2026-06-01"
+}
+```
+
+The worker loads the matching job and image rows, reads the original object bytes,
+validates and normalizes the image, writes derived JPEG objects, and records exact
+hash metadata.
+
+Derived object keys are deterministic:
+
+```text
+organizations/{organizationId}/batches/{batchId}/derived/{pipelineVersion}/{imageId}/normalized.jpg
+organizations/{organizationId}/batches/{batchId}/derived/{pipelineVersion}/{imageId}/inference.jpg
+organizations/{organizationId}/batches/{batchId}/derived/{pipelineVersion}/{imageId}/thumbnail.jpg
+```
+
+The worker:
+
+- computes `sha256` from the untouched original bytes;
+- computes `phash` and `dhash` from the normalized JPEG bytes;
+- generates one `gemini-embedding-2` image embedding from the bounded inference
+  JPEG through the internal embedding provider interface;
+- applies EXIF orientation only to derived images;
+- records normalized `width`, `height`, `normalized_format`, and
+  `normalized_size_bytes`;
+- writes one `image_embeddings` row per organization, image, and pipeline version
+  with a 768-dimension vector;
+- stores the normalized full-size JPEG, an inference JPEG capped at 1024 pixels on
+  the longest edge, and a thumbnail JPEG capped at 480 pixels on the longest edge;
+- moves the image from `uploaded` to `processing`, then to `processed` or `failed`;
+- increments `upload_batches.processed_file_count` only once, when the image first
+  reaches a terminal worker result.
+
+Perceptual hashes and embeddings are persisted in the same database transaction as
+the image row update. A repeated successful task delivery is a no-op only when the
+image already has `phash`, `dhash`, and an embedding row for the active pipeline
+version.
+
+Terminal image failures return HTTP `200`, mark the image and job `failed`, and do not
+retry the same impossible work:
+
+- `source_object_missing`;
+- `image_decode_failed`;
+- `unsupported_image_mode`.
+
+Retryable infrastructure failures return HTTP `500`, keep the image eligible for a
+later retry, and do not advance terminal counters:
+
+- `source_object_read_failed`;
+- `derived_object_write_failed`;
+- `image_hash_generation_failed`;
+- `embedding_generation_failed`;
+- `database_error`.
+
+The prototype worker uses the same private bucket as uploads. The local service
+account needs object read access for originals and object create access for derived
+outputs. Real embedding generation uses `google-genai`; the Gemini client reads
+`GEMINI_API_KEY` from the environment. Tests replace this dependency with a fake
+embedding provider.
 
 ## Default Organization
 
@@ -283,6 +427,37 @@ Start PostgreSQL from the repository root:
 docker compose up -d postgres
 ```
 
+If the local PostgreSQL service was already running before ticket `0013a`,
+restart it so Compose recreates the container with the pgvector image:
+
+```bash
+docker compose up -d --force-recreate postgres
+```
+
+Existing local data volumes normally do not need to be reset because the database
+major version stays on PostgreSQL 16. If migration `0004_pgvector_foundation`
+fails with a missing `vector.control` extension file, confirm the service is using
+`pgvector/pgvector:pg16`. For a clean local database reset, remove the Compose
+volume and start PostgreSQL again. This deletes local development data:
+
+```bash
+docker compose down -v
+docker compose up -d postgres
+```
+
+If the existing local volume reports a collation version mismatch after switching
+to the pgvector image, refresh the local database collation metadata:
+
+```bash
+docker compose exec postgres psql -U catalog -d postgres -v ON_ERROR_STOP=1 \
+  -c "ALTER DATABASE postgres REFRESH COLLATION VERSION;" \
+  -c "ALTER DATABASE template1 REFRESH COLLATION VERSION;" \
+  -c "ALTER DATABASE catalog_classifier REFRESH COLLATION VERSION;"
+```
+
+This is a local development repair step for a reused volume. Production databases
+need a proper collation/index maintenance plan before refreshing collation metadata.
+
 The default connection string is:
 
 ```text
@@ -302,6 +477,7 @@ Start the API after upgrading:
 ```bash
 export CATALOG_UPLOAD_BUCKET=lnlabs-bucket
 export CATALOG_SIGNING_SERVICE_ACCOUNT="catalog-api@catalog-classifier.iam.gserviceaccount.com"
+export GEMINI_API_KEY="<your Gemini API key>"
 .venv/bin/uvicorn catalog_api.main:app --reload --port 8000
 ```
 
@@ -310,6 +486,8 @@ adding or changing them because a running process does not inherit later shell c
 If the bucket configuration or signing credentials are unavailable, file registration
 returns `500` with error code `upload_registration_failed`. The registration
 transaction is rolled back: the batch remains `created`, and no image rows are retained.
+If `GEMINI_API_KEY` is unavailable, upload and finalization routes still work, but the
+real `process-image` worker path cannot generate embeddings.
 
 A successful registration response confirms that metadata and signed URLs were
 created. It does not confirm that image bytes reached Cloud Storage. The client must
@@ -374,9 +552,11 @@ CATALOG_TEST_DATABASE_URL=postgresql+psycopg://catalog:catalog@localhost:5432/po
 ```
 
 The PostgreSQL checks verify upgrade, schema and model alignment, constraints, ordered
-image retrieval, the default organization seed, batch endpoint persistence and failure
-handling, and downgrade with all application tables removed. Alembic retains its empty
-`alembic_version` bookkeeping table.
+image retrieval, the default organization seed, pgvector extension availability, a
+`vector(768)` SQLAlchemy round trip, image embedding persistence, batch endpoint
+persistence and failure handling, and downgrade with all application tables and
+ticket-managed extensions removed.
+Alembic retains its empty `alembic_version` bookkeeping table.
 
 Verify the real signing configuration without uploading an object:
 

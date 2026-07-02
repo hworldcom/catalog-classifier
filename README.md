@@ -195,6 +195,9 @@ catalog-classifier/
 └── README.md
 ```
 
+For the current local startup flow, including the commands to start each running
+component, see [`docs/local-start.md`](docs/local-start.md).
+
 The Next.js frontend must use a generated OpenAPI client. Do not manually duplicate request and response interfaces in Python and TypeScript.
 
 ---
@@ -325,6 +328,22 @@ permission to overwrite existing objects. Signing and object-key updates are
 all-or-nothing. Objects from earlier attempts are intentionally retained until the
 later stale-object cleanup slice.
 
+The ingest page exposes this flow inline. Retryable rows have checkboxes and a
+`Retry selected` action. Before requesting new URLs, the browser reloads the durable
+batch and reconciles it with the current in-memory upload results:
+
+* durable `uploaded` rows are never retried;
+* durable `failed` rows require their original browser `File`;
+* durable `pending` rows preserve a local `uploaded` result and allow a local
+  `pending` or `failed` result to retry;
+* rows without an in-memory file remain visible but cannot retry.
+
+If the batch or selected rows changed, the user must review and select again. The
+browser validates that the retry response contains exactly the requested image
+identifiers before sending any file bytes, uploads at most four retry files at once,
+and preserves per-row local results after the attempts finish. Selecting a new file
+set discards the current in-memory retry session.
+
 ---
 
 ## 6. Image-processing pipeline
@@ -377,7 +396,15 @@ A perceptual-hash match does not by itself prove that two images belong to the s
 
 ### Stage D: Image embedding
 
-Generate one image embedding per normalized image.
+Generate one image embedding per processed image.
+Store one embedding row per organization, image, and pipeline version.
+This stage is forward-only: images already completed before this ticket lands
+are not backfilled here.
+The embedding input is the bounded inference image created in Stage B.
+This stage depends on ticket `0013a-pgvector-foundation`, which enables vector
+storage in PostgreSQL.
+Local development uses the `pgvector/pgvector:pg16` PostgreSQL image; service-level
+setup and reset notes live in `services/api/README.md`.
 
 Initial configuration:
 
@@ -406,6 +433,9 @@ class ImageEmbeddingProvider(Protocol):
 ```
 
 Business logic must not call the Gemini SDK directly.
+The prototype implementation uses `google-genai` behind that interface and reads
+`GEMINI_API_KEY` from the worker environment. Automated tests must use a fake
+embedding provider rather than calling Gemini.
 
 ### Stage E: Category classification
 
@@ -661,6 +691,7 @@ organization_id
 batch_id
 original_object_key
 normalized_object_key
+inference_object_key
 thumbnail_object_key
 original_filename
 upload_order
@@ -668,6 +699,8 @@ mime_type
 size_bytes
 width
 height
+normalized_format
+normalized_size_bytes
 sha256
 phash
 dhash
@@ -677,17 +710,32 @@ error_message
 created_at
 ```
 
+`size_bytes` remains the original uploaded file size from registration. The
+normalized image uses the new `normalized_format` and `normalized_size_bytes`
+fields, while `width` and `height` describe the normalized image after EXIF
+orientation and conversion.
+
+`phash` and `dhash` are stored as lowercase 16-character hexadecimal strings
+derived from the normalized image.
+
 #### `image_embeddings`
 
 ```text
 id
+organization_id
 image_id
 provider
 model
 dimensions
+pipeline_version
 embedding vector(768)
 created_at
 ```
+
+The schema stores one embedding row per organization, image, and pipeline
+version.
+The embedding row uses an organization-scoped foreign key from
+`(organization_id, image_id)` to the processed image row.
 
 #### `categories`
 
@@ -779,16 +827,21 @@ created_at
 
 ```text
 id
+organization_id
 batch_id
 image_id nullable
 job_type
 status
 attempt_count
+pipeline_version
+created_at
 started_at
 completed_at
 error_message
 idempotency_key
 ```
+
+Processing jobs use the statuses `pending`, `started`, `completed`, and `failed`.
 
 #### `catalog_products`
 
@@ -844,7 +897,12 @@ POST /internal/tasks/group-batch
 POST /internal/tasks/find-existing-products
 ```
 
-These endpoints must require authenticated service-to-service requests. They must not be publicly callable.
+Milestone 2 prototype work uses a local fake queue and the local `process-image`
+worker. Ticket `0016` adds Cloud Tasks and authenticated service-to-service worker
+requests for production hardening.
+
+In production, these endpoints must require authenticated service-to-service
+requests. They must not be publicly callable.
 
 ---
 
@@ -1412,13 +1470,31 @@ engineering decisions, migration commands, and validation workflow are maintaine
 
 Deliver:
 
-* Cloud Tasks integration;
+* processing job foundation;
 * worker service;
 * validation and normalization;
 * exact hashes;
 * perceptual hashes;
 * image embeddings;
 * category suggestions.
+
+#### Milestone 2 implementation sequence
+
+Keep this milestone narrow and vertical:
+
+1. Add processing job schema, local queue dispatch, and a worker entrypoint.
+2. Validate, normalize, and hash each image.
+3. Add pgvector storage foundation in ticket `0013a`.
+4. Finalize successful direct browser uploads from the frontend in ticket `0013b`.
+5. Generate perceptual hashes and embeddings in ticket `0013c`.
+6. Write category suggestions.
+7. Add the read-only processing page with polling.
+
+Milestone 2 ends with per-image processing data persisted in the database and a
+read-only page that shows it. Grouping and review remain in Milestone 3.
+
+Prototype work uses a local fake queue. Cloud Tasks integration and worker
+authentication are deferred to a later hardening ticket.
 
 ### Milestone 3: Grouping and review
 

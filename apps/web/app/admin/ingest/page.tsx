@@ -3,10 +3,18 @@
 import { ChangeEvent, FormEvent, useState } from "react";
 
 import {
-  DirectUpload,
+  DurableUploadError,
+  UploadSessionRow,
   createUploadBatch,
+  finalizeUploadBatch,
+  isRetryableUpload,
+  loadUploadBatch,
   prepareDirectUploads,
+  prepareRetryUploads,
+  reconcileUploadSessionRows,
   registerUploadFiles,
+  requestRetryUploads,
+  toUploadSessionRows,
   uploadDirectFiles,
   validateUploadFiles,
 } from "@/lib/durable-uploads";
@@ -14,9 +22,15 @@ import {
 export default function UploadPage() {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [batchId, setBatchId] = useState<string | null>(null);
-  const [uploads, setUploads] = useState<DirectUpload[] | null>(null);
+  const [batchStatus, setBatchStatus] = useState<string | null>(null);
+  const [uploads, setUploads] = useState<UploadSessionRow[] | null>(null);
+  const [selectedRetryImageIds, setSelectedRetryImageIds] = useState<Set<string>>(
+    new Set(),
+  );
   const [error, setError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
+  const isBusy = isUploading || isRetrying;
   const uploadedCount =
     uploads?.filter((upload) => upload.status === "uploaded").length ?? 0;
   const failedCount =
@@ -44,7 +58,9 @@ export default function UploadPage() {
     const files = Array.from(event.target.files ?? []);
     setSelectedFiles(files);
     setBatchId(null);
+    setBatchStatus(null);
     setUploads(null);
+    setSelectedRetryImageIds(new Set());
     setError(files.length === 0 ? null : validateUploadFiles(files));
   }
 
@@ -60,35 +76,41 @@ export default function UploadPage() {
     setIsUploading(true);
     setError(null);
     setBatchId(null);
+    setBatchStatus(null);
     setUploads(null);
+    setSelectedRetryImageIds(new Set());
 
     try {
       const batch = await createUploadBatch();
       setBatchId(batch.batchId);
+      setBatchStatus(batch.status);
 
       const registration = await registerUploadFiles(
         batch.batchId,
         selectedFiles,
       );
+      setBatchStatus(registration.status);
       const pendingUploads = prepareDirectUploads(
         selectedFiles,
         registration.uploads,
       );
-      setUploads(pendingUploads);
+      setUploads(toUploadSessionRows(pendingUploads));
 
       const completedUploads = await uploadDirectFiles(
         pendingUploads,
         (updatedUpload) => {
           setUploads((currentUploads) =>
             currentUploads?.map((upload) =>
-              upload.uploadOrder === updatedUpload.uploadOrder
-                ? updatedUpload
+              upload.imageId === updatedUpload.imageId
+                ? sessionRowFromUpload(updatedUpload)
                 : upload,
             ) ?? null,
           );
         },
       );
-      setUploads(completedUploads);
+      const completedRows = toUploadSessionRows(completedUploads);
+      setUploads(completedRows);
+      await finalizeIfEveryRowUploaded(batch.batchId, completedRows);
     } catch (uploadError) {
       setError(
         uploadError instanceof Error
@@ -98,6 +120,113 @@ export default function UploadPage() {
     } finally {
       setIsUploading(false);
     }
+  }
+
+  function toggleRetrySelection(imageId: string) {
+    setSelectedRetryImageIds((currentSelection) => {
+      const nextSelection = new Set(currentSelection);
+      if (nextSelection.has(imageId)) {
+        nextSelection.delete(imageId);
+      } else {
+        nextSelection.add(imageId);
+      }
+      return nextSelection;
+    });
+  }
+
+  async function handleRetrySelected() {
+    if (!batchId || !uploads || selectedRetryImageIds.size === 0) {
+      return;
+    }
+
+    setIsRetrying(true);
+    setError(null);
+
+    try {
+      const batch = await loadUploadBatch(batchId);
+      setBatchStatus(batch.status);
+      const reconciledUploads = reconcileUploadSessionRows(uploads, batch);
+      setUploads(reconciledUploads);
+
+      if (batch.status !== "uploading") {
+        setSelectedRetryImageIds(new Set());
+        throw new DurableUploadError(
+          "This batch is no longer uploading and cannot accept retries.",
+        );
+      }
+
+      const selectedRows = reconciledUploads
+        .filter((upload) => selectedRetryImageIds.has(upload.imageId))
+        .sort((left, right) => left.uploadOrder - right.uploadOrder);
+      if (
+        selectedRows.length !== selectedRetryImageIds.size ||
+        selectedRows.some((upload) => !isRetryableUpload(upload))
+      ) {
+        setSelectedRetryImageIds(new Set());
+        throw new DurableUploadError(
+          "Upload state changed. Review the retryable rows and select them again.",
+        );
+      }
+
+      const selectedImageIds = selectedRows.map((upload) => upload.imageId);
+      const retryRegistration = await requestRetryUploads(
+        batchId,
+        selectedImageIds,
+      );
+      setBatchStatus(retryRegistration.status);
+      const retryUploads = prepareRetryUploads(
+        reconciledUploads,
+        selectedImageIds,
+        retryRegistration.uploads,
+      );
+
+      setUploads((currentUploads) =>
+        updateSessionRows(
+          currentUploads,
+          retryUploads.map(sessionRowFromUpload),
+        ),
+      );
+
+      const completedRetries = await uploadDirectFiles(
+        retryUploads,
+        (updatedUpload) => {
+          setUploads((currentUploads) =>
+            updateSessionRows(currentUploads, [
+              sessionRowFromUpload(updatedUpload),
+            ]),
+          );
+        },
+      );
+      const completedRetryRows = completedRetries.map(sessionRowFromUpload);
+      const nextRows = updateSessionRows(reconciledUploads, completedRetryRows);
+      setUploads(nextRows);
+      setSelectedRetryImageIds(new Set());
+      if (nextRows) {
+        await finalizeIfEveryRowUploaded(batchId, nextRows);
+      }
+    } catch (retryError) {
+      setError(
+        retryError instanceof Error
+          ? retryError.message
+          : "The retry request failed.",
+      );
+    } finally {
+      setIsRetrying(false);
+    }
+  }
+
+  async function finalizeIfEveryRowUploaded(
+    uploadBatchId: string,
+    rows: UploadSessionRow[],
+  ) {
+    if (!rows.every((row) => row.status === "uploaded")) {
+      return;
+    }
+
+    const finalizedBatch = await finalizeUploadBatch(uploadBatchId);
+    setBatchStatus(finalizedBatch.status);
+    setUploads(reconcileUploadSessionRows(rows, finalizedBatch));
+    setSelectedRetryImageIds(new Set());
   }
 
   return (
@@ -119,7 +248,7 @@ export default function UploadPage() {
               accept=".jpg,.jpeg,image/jpeg"
               multiple
               onChange={handleFileSelection}
-              disabled={isUploading}
+              disabled={isBusy}
             />
           </label>
 
@@ -133,7 +262,7 @@ export default function UploadPage() {
 
           <button
             type="submit"
-            disabled={isUploading || selectedFiles.length === 0}
+            disabled={isBusy || selectedFiles.length === 0}
           >
             {isUploading ? "Uploading..." : uploadButtonLabel}
           </button>
@@ -149,6 +278,9 @@ export default function UploadPage() {
           <section className="message batch-created" aria-live="polite">
             <strong>Durable upload batch</strong>
             <span className="upload-id">{batchId}</span>
+            {batchStatus ? (
+              <span className="batch-status">Backend status: {batchStatus}</span>
+            ) : null}
           </section>
         ) : null}
 
@@ -166,6 +298,18 @@ export default function UploadPage() {
             <ul className="file-results">
               {uploads.map((upload) => (
                 <li key={upload.imageId}>
+                  <label className="retry-checkbox">
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${upload.originalFilename} item ${
+                        upload.uploadOrder + 1
+                      } for retry`}
+                      checked={selectedRetryImageIds.has(upload.imageId)}
+                      disabled={isBusy || !isRetryableUpload(upload)}
+                      onChange={() => toggleRetrySelection(upload.imageId)}
+                    />
+                    <span>Retry</span>
+                  </label>
                   <span>{upload.originalFilename}</span>
                   <span className={`file-status ${upload.status}`}>
                     {upload.status}
@@ -176,9 +320,54 @@ export default function UploadPage() {
                 </li>
               ))}
             </ul>
+            <div className="retry-actions">
+              <span>
+                {selectedRetryImageIds.size} selected for retry
+              </span>
+              <button
+                type="button"
+                onClick={handleRetrySelected}
+                disabled={isBusy || selectedRetryImageIds.size === 0}
+              >
+                {isRetrying ? "Retrying..." : "Retry selected"}
+              </button>
+            </div>
           </section>
         ) : null}
       </section>
     </main>
   );
+}
+
+function sessionRowFromUpload(
+  upload: {
+    imageId: string;
+    uploadOrder: number;
+    originalFilename: string;
+    file: File;
+    status: UploadSessionRow["status"];
+    errorMessage: string | null;
+  },
+): UploadSessionRow {
+  return {
+    imageId: upload.imageId,
+    uploadOrder: upload.uploadOrder,
+    originalFilename: upload.originalFilename,
+    file: upload.file,
+    status: upload.status,
+    errorMessage: upload.errorMessage,
+  };
+}
+
+function updateSessionRows(
+  currentRows: UploadSessionRow[] | null,
+  updatedRows: UploadSessionRow[],
+): UploadSessionRow[] | null {
+  if (!currentRows) {
+    return null;
+  }
+  const updatesById = new Map(
+    updatedRows.map((upload) => [upload.imageId, upload]),
+  );
+  return currentRows.map((upload) => updatesById.get(upload.imageId) ?? upload);
 }
