@@ -281,6 +281,11 @@ export default function UploadPage() {
             {batchStatus ? (
               <span className="batch-status">Backend status: {batchStatus}</span>
             ) : null}
+            {batchStatus === "queued" ? (
+              <a className="text-link" href={`/admin/processing/${batchId}`}>
+                Open processing dashboard
+              </a>
+            ) : null}
           </section>
         ) : null}
 

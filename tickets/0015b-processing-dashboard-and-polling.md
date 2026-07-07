@@ -23,6 +23,15 @@ finalized batch and observe per-image processing and classification results.
   until every visible image has terminal process and classify states.
 - Do not call `POST /v1/upload-batches/{batchId}/start-processing` again during
   polling.
+- Polling stop condition:
+  - `processJobStatus` is terminal when it is `completed` or `failed`;
+  - `classifyJobStatus` is terminal when it is `completed` or `failed`;
+  - if `processJobStatus` is `failed` and `classifyJobStatus` is missing, the
+    image is terminal because classification is not expected after failed image
+    processing;
+  - if `processJobStatus` is `completed` and `classifyJobStatus` is missing, the
+    image is not terminal yet because classification should still be created or
+    run.
 - Render batch-level state:
   - batch identifier;
   - batch status;

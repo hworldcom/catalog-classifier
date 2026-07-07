@@ -6,13 +6,17 @@ import {
   MAX_FILE_SIZE_BYTES,
   createUploadBatch,
   finalizeUploadBatch,
+  isProcessingBatchTerminal,
+  isProcessingImageTerminal,
   isRetryableUpload,
+  loadProcessingBatch,
   loadUploadBatch,
   prepareDirectUploads,
   prepareRetryUploads,
   reconcileUploadSessionRows,
   registerUploadFiles,
   requestRetryUploads,
+  startUploadBatchProcessing,
   toUploadSessionRows,
   uploadDirectFiles,
   validateUploadFiles,
@@ -47,6 +51,26 @@ function batchImage(
     status,
     errorCode: errorMessage ? "upload_error" : null,
     errorMessage,
+  };
+}
+
+function processingImage(
+  processJobStatus: string | null,
+  classifyJobStatus: string | null,
+) {
+  return {
+    imageId: "image-0",
+    uploadOrder: 0,
+    originalFilename: "image-0.jpg",
+    imageStatus: processJobStatus === "completed" ? "processed" : "uploaded",
+    processJobStatus,
+    processError: null,
+    classifyJobStatus,
+    classifyError: null,
+    categorySlug: classifyJobStatus === "completed" ? "t-shirts" : null,
+    confidence: classifyJobStatus === "completed" ? 0.91 : null,
+    hasHashes: processJobStatus === "completed",
+    hasEmbedding: processJobStatus === "completed",
   };
 }
 
@@ -287,6 +311,71 @@ describe("durable upload client", () => {
     ).rejects.toEqual(
       new DurableUploadError("Unable to finalize the upload batch."),
     );
+  });
+
+  it("loads and starts processing through public batch endpoints", async () => {
+    const processingBody = {
+      batchId: "batch-1",
+      status: "processing",
+      originalFileCount: 1,
+      processedFileCount: 0,
+      pipelineVersion: "2026-06-01",
+      images: [processingImage("pending", null)],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(processingBody))
+      .mockResolvedValueOnce(jsonResponse(processingBody));
+
+    await expect(
+      loadProcessingBatch(
+        "batch-1",
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(processingBody);
+    await expect(
+      startUploadBatchProcessing(
+        "batch-1",
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(processingBody);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://api.example.test/v1/upload-batches/batch-1/processing",
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://api.example.test/v1/upload-batches/batch-1/start-processing",
+      { method: "POST" },
+    );
+  });
+
+  it("detects terminal processing states", () => {
+    expect(
+      isProcessingImageTerminal(processingImage("completed", "completed")),
+    ).toBe(true);
+    expect(isProcessingImageTerminal(processingImage("failed", null))).toBe(
+      true,
+    );
+    expect(isProcessingImageTerminal(processingImage("completed", null))).toBe(
+      false,
+    );
+    expect(isProcessingImageTerminal(processingImage("pending", null))).toBe(
+      false,
+    );
+    expect(
+      isProcessingBatchTerminal({
+        batchId: "batch-1",
+        status: "processing",
+        originalFileCount: 1,
+        processedFileCount: 1,
+        pipelineVersion: "2026-06-01",
+        images: [processingImage("completed", "completed")],
+      }),
+    ).toBe(true);
   });
 
   it("matches duplicate filenames to registrations by upload order", () => {

@@ -216,31 +216,31 @@ def claim_batch_for_processing(
     }
 
     enqueued_tasks: list[ProcessImageTaskPayload] = []
-    if batch.status == "queued":
-        for image in images:
-            if image.id in existing_jobs_by_image_id:
-                continue
-            task = ProcessImageTaskPayload(
-                batch_id=batch.id,
+    for image in images:
+        if image.id in existing_jobs_by_image_id or image.status == "failed":
+            continue
+        task = ProcessImageTaskPayload(
+            batch_id=batch.id,
+            image_id=image.id,
+            pipeline_version=normalized_pipeline_version,
+        )
+        job = ProcessingJob(
+            organization_id=batch.organization_id,
+            batch_id=batch.id,
+            image_id=image.id,
+            job_type=PROCESS_IMAGE_JOB_TYPE,
+            pipeline_version=normalized_pipeline_version,
+            idempotency_key=process_image_idempotency_key(
                 image_id=image.id,
                 pipeline_version=normalized_pipeline_version,
-            )
-            job = ProcessingJob(
-                organization_id=batch.organization_id,
-                batch_id=batch.id,
-                image_id=image.id,
-                job_type=PROCESS_IMAGE_JOB_TYPE,
-                pipeline_version=normalized_pipeline_version,
-                idempotency_key=process_image_idempotency_key(
-                    image_id=image.id,
-                    pipeline_version=normalized_pipeline_version,
-                ),
-            )
-            session.add(job)
-            existing_jobs.append(job)
-            existing_jobs_by_image_id[image.id] = job
-            enqueued_tasks.append(task)
+            ),
+        )
+        session.add(job)
+        existing_jobs.append(job)
+        existing_jobs_by_image_id[image.id] = job
+        enqueued_tasks.append(task)
 
+    if batch.status == "queued":
         batch.status = "processing"
         batch.pipeline_version = normalized_pipeline_version
 
@@ -260,9 +260,72 @@ def claim_batch_for_processing(
                 status=existing_jobs_by_image_id[image.id].status,
             )
             for image in images
+            if image.id in existing_jobs_by_image_id
         ],
         enqueued_tasks=enqueued_tasks,
     )
+
+
+def ensure_classify_jobs_for_processed_images(
+    session: Session,
+    *,
+    batch_id: UUID,
+    pipeline_version: str,
+) -> list[ClassifyImageTaskPayload]:
+    processed_images = session.scalars(
+        select(ImageAsset)
+        .where(
+            ImageAsset.batch_id == batch_id,
+            ImageAsset.organization_id == DEFAULT_ORGANIZATION_ID,
+            ImageAsset.status == "processed",
+        )
+        .order_by(ImageAsset.upload_order)
+        .with_for_update()
+    ).all()
+    if not processed_images:
+        return []
+
+    existing_jobs = session.scalars(
+        select(ProcessingJob)
+        .where(
+            ProcessingJob.batch_id == batch_id,
+            ProcessingJob.organization_id == DEFAULT_ORGANIZATION_ID,
+            ProcessingJob.job_type == CLASSIFY_IMAGE_JOB_TYPE,
+            ProcessingJob.pipeline_version == pipeline_version,
+            ProcessingJob.image_id.in_([image.id for image in processed_images]),
+        )
+        .with_for_update()
+    ).all()
+    existing_image_ids = {
+        job.image_id for job in existing_jobs if job.image_id is not None
+    }
+
+    tasks: list[ClassifyImageTaskPayload] = []
+    for image in processed_images:
+        if image.id in existing_image_ids:
+            continue
+        task = ClassifyImageTaskPayload(
+            batch_id=image.batch_id,
+            image_id=image.id,
+            pipeline_version=pipeline_version,
+        )
+        session.add(
+            ProcessingJob(
+                organization_id=image.organization_id,
+                batch_id=image.batch_id,
+                image_id=image.id,
+                job_type=CLASSIFY_IMAGE_JOB_TYPE,
+                pipeline_version=pipeline_version,
+                idempotency_key=classify_image_idempotency_key(
+                    image_id=image.id,
+                    pipeline_version=pipeline_version,
+                ),
+            )
+        )
+        tasks.append(task)
+
+    session.commit()
+    return tasks
 
 
 def process_image_task(

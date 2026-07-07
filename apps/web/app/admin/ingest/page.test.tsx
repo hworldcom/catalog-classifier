@@ -248,6 +248,9 @@ describe("UploadPage", () => {
     expect(await screen.findByText("1 uploaded, 0 failed.")).toBeInTheDocument();
     expect(finalizeUploadBatchMock).toHaveBeenCalledWith("batch-3");
     expect(await screen.findByText("Backend status: queued")).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Open processing dashboard" }),
+    ).toHaveAttribute("href", "/admin/processing/batch-3");
     await waitFor(() => {
       expect(screen.getByLabelText("JPEG images")).toBeEnabled();
       expect(

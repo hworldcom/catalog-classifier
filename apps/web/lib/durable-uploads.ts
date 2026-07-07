@@ -42,6 +42,30 @@ export type UploadBatchResult = {
   images: UploadBatchImage[];
 };
 
+export type ProcessingBatchImage = {
+  imageId: string;
+  uploadOrder: number;
+  originalFilename: string;
+  imageStatus: string;
+  processJobStatus: string | null;
+  processError: string | null;
+  classifyJobStatus: string | null;
+  classifyError: string | null;
+  categorySlug: string | null;
+  confidence: number | null;
+  hasHashes: boolean;
+  hasEmbedding: boolean;
+};
+
+export type ProcessingBatchResult = {
+  batchId: string;
+  status: string;
+  originalFileCount: number;
+  processedFileCount: number;
+  pipelineVersion: string;
+  images: ProcessingBatchImage[];
+};
+
 export type DirectUploadStatus =
   | "pending"
   | "uploading"
@@ -192,6 +216,39 @@ export async function finalizeUploadBatch(
   return (await response.json()) as UploadBatchResult;
 }
 
+export async function loadProcessingBatch(
+  batchId: string,
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<ProcessingBatchResult> {
+  const response = await fetchImplementation(
+    apiUrl(`/v1/upload-batches/${batchId}/processing`, baseUrl),
+  );
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as ProcessingBatchResult;
+}
+
+export async function startUploadBatchProcessing(
+  batchId: string,
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<ProcessingBatchResult> {
+  const response = await fetchImplementation(
+    apiUrl(`/v1/upload-batches/${batchId}/start-processing`, baseUrl),
+    { method: "POST" },
+  );
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as ProcessingBatchResult;
+}
+
 export async function requestRetryUploads(
   batchId: string,
   imageIds: string[],
@@ -339,6 +396,33 @@ export function reconcileUploadSessionRows(
   }
 
   return reconciledRows;
+}
+
+export function isProcessingImageTerminal(
+  image: ProcessingBatchImage,
+): boolean {
+  if (
+    image.processJobStatus === "failed" &&
+    image.classifyJobStatus === null
+  ) {
+    return true;
+  }
+
+  return (
+    (image.processJobStatus === "completed" ||
+      image.processJobStatus === "failed") &&
+    (image.classifyJobStatus === "completed" ||
+      image.classifyJobStatus === "failed")
+  );
+}
+
+export function isProcessingBatchTerminal(
+  batch: ProcessingBatchResult,
+): boolean {
+  return (
+    batch.images.length > 0 &&
+    batch.images.every((image) => isProcessingImageTerminal(image))
+  );
 }
 
 export function prepareRetryUploads(

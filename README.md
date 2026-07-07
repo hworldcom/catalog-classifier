@@ -1511,9 +1511,11 @@ Keep this milestone narrow and vertical:
 7. Write category suggestions in ticket `0014b`.
 8. Add the start-processing endpoint in ticket `0015a`.
 9. Add the read-only processing page with polling in ticket `0015b`.
+10. Add thumbnail access and rendering in ticket `0015c`.
 
 Milestone 2 ends with per-image processing data persisted in the database and a
-read-only page that shows it. Grouping and review remain in Milestone 3.
+read-only page that shows it, including thumbnails. Grouping and review remain
+in Milestone 3.
 
 Prototype work uses a local fake queue and the local `process-image` and
 `classify-image` workers. Cloud Tasks integration and worker authentication are

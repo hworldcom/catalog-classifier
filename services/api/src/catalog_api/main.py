@@ -39,12 +39,21 @@ from catalog_api.local_batches import (
 from catalog_api.processing_jobs import (
     ClassifyImageTaskPayload,
     ProcessImageTaskPayload,
+    ProcessingBatchNotFoundError,
+    ProcessingBatchStateError,
     ProcessingQueue,
     ProcessingJobExecutionError,
     ProcessingJobNotFoundError,
     classify_image_task,
     get_processing_queue,
     process_image_task,
+)
+from catalog_api.processing_orchestration import (
+    ProcessingBatchState,
+    ProcessingRunner,
+    get_processing_batch_state,
+    get_processing_runner,
+    start_processing_batch,
 )
 from catalog_api.processing_storage import WorkerStorage, get_worker_storage
 from catalog_api.upload_batches import (
@@ -170,6 +179,39 @@ class UploadBatchResponse(ApiModel):
     finalized_at: datetime | None = Field(serialization_alias="finalizedAt")
     completed_at: datetime | None = Field(serialization_alias="completedAt")
     images: list[UploadBatchImageResponse]
+
+
+class ProcessingBatchImageResponse(ApiModel):
+    image_id: UUID = Field(serialization_alias="imageId")
+    upload_order: int = Field(serialization_alias="uploadOrder")
+    original_filename: str = Field(serialization_alias="originalFilename")
+    image_status: str = Field(serialization_alias="imageStatus")
+    process_job_status: str | None = Field(
+        default=None,
+        serialization_alias="processJobStatus",
+    )
+    process_error: str | None = Field(default=None, serialization_alias="processError")
+    classify_job_status: str | None = Field(
+        default=None,
+        serialization_alias="classifyJobStatus",
+    )
+    classify_error: str | None = Field(
+        default=None,
+        serialization_alias="classifyError",
+    )
+    category_slug: str | None = Field(default=None, serialization_alias="categorySlug")
+    confidence: float | None = None
+    has_hashes: bool = Field(serialization_alias="hasHashes")
+    has_embedding: bool = Field(serialization_alias="hasEmbedding")
+
+
+class ProcessingBatchResponse(ApiModel):
+    batch_id: UUID = Field(serialization_alias="batchId")
+    status: str
+    original_file_count: int = Field(serialization_alias="originalFileCount")
+    processed_file_count: int = Field(serialization_alias="processedFileCount")
+    pipeline_version: str = Field(serialization_alias="pipelineVersion")
+    images: list[ProcessingBatchImageResponse]
 
 
 class LocalBatchFileResult(ApiModel):
@@ -352,6 +394,16 @@ def _upload_batch_finalization_error() -> HTTPException:
     )
 
 
+def _processing_batch_state_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "invalid_batch_state",
+            "message": "Upload batch is not ready for processing.",
+        },
+    )
+
+
 def _invalid_retry_selection(message: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
@@ -423,6 +475,35 @@ def _upload_batch_response(snapshot: UploadBatchState) -> UploadBatchResponse:
                 status=image.status,
                 error_code=image.error_code,
                 error_message=image.error_message,
+            )
+            for image in snapshot.images
+        ],
+    )
+
+
+def _processing_batch_response(
+    snapshot: ProcessingBatchState,
+) -> ProcessingBatchResponse:
+    return ProcessingBatchResponse(
+        batch_id=snapshot.batch_id,
+        status=snapshot.status,
+        original_file_count=snapshot.original_file_count,
+        processed_file_count=snapshot.processed_file_count,
+        pipeline_version=snapshot.pipeline_version,
+        images=[
+            ProcessingBatchImageResponse(
+                image_id=image.image_id,
+                upload_order=image.upload_order,
+                original_filename=image.original_filename,
+                image_status=image.image_status,
+                process_job_status=image.process_job_status,
+                process_error=image.process_error,
+                classify_job_status=image.classify_job_status,
+                classify_error=image.classify_error,
+                category_slug=image.category_slug,
+                confidence=image.confidence,
+                has_hashes=image.has_hashes,
+                has_embedding=image.has_embedding,
             )
             for image in snapshot.images
         ],
@@ -599,6 +680,58 @@ def finalize_durable_upload_batch(
         ) from error
 
     return _upload_batch_response(snapshot)
+
+
+@app.post(
+    "/v1/upload-batches/{batch_id}/start-processing",
+    response_model=ProcessingBatchResponse,
+    status_code=status.HTTP_200_OK,
+)
+def start_durable_upload_batch_processing(
+    batch_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+    runner: Annotated[ProcessingRunner, Depends(get_processing_runner)],
+) -> ProcessingBatchResponse:
+    try:
+        snapshot = start_processing_batch(
+            session,
+            batch_id=batch_id,
+            runner=runner,
+        )
+    except ProcessingBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ProcessingBatchStateError as error:
+        raise _processing_batch_state_error() from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to start upload batch processing."
+        ) from error
+
+    return _processing_batch_response(snapshot)
+
+
+@app.get(
+    "/v1/upload-batches/{batch_id}/processing",
+    response_model=ProcessingBatchResponse,
+)
+def get_durable_upload_batch_processing(
+    batch_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> ProcessingBatchResponse:
+    try:
+        snapshot = get_processing_batch_state(session, batch_id=batch_id)
+    except ProcessingBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ProcessingBatchStateError as error:
+        raise _processing_batch_state_error() from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to load upload batch processing state."
+        ) from error
+
+    return _processing_batch_response(snapshot)
 
 
 @app.post(
