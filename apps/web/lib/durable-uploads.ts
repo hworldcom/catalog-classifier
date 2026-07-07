@@ -249,6 +249,17 @@ export async function startUploadBatchProcessing(
   return (await response.json()) as ProcessingBatchResult;
 }
 
+export function processingThumbnailUrl(
+  batchId: string,
+  imageId: string,
+  baseUrl = apiBaseUrl(),
+): string {
+  return apiUrl(
+    `/v1/upload-batches/${batchId}/images/${imageId}/thumbnail`,
+    baseUrl,
+  );
+}
+
 export async function requestRetryUploads(
   batchId: string,
   imageIds: string[],

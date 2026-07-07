@@ -34,7 +34,9 @@ from catalog_api.processing_jobs import (
     process_image_idempotency_key,
 )
 from catalog_api.processing_storage import (
+    WorkerObjectReadError,
     WorkerObjectNotFoundError,
+    get_worker_storage,
 )
 from catalog_api.upload_batches import DEFAULT_ORGANIZATION_ID
 
@@ -52,11 +54,14 @@ class StoredObject:
 class FakeWorkerStorage:
     def __init__(self) -> None:
         self.objects: dict[str, StoredObject] = {}
+        self.read_error_keys: set[str] = set()
         self.reads: list[str] = []
         self.writes: list[tuple[str, str, bytes]] = []
 
     def read_object_bytes(self, *, object_key: str) -> bytes:
         self.reads.append(object_key)
+        if object_key in self.read_error_keys:
+            raise WorkerObjectReadError
         try:
             return self.objects[object_key].data
         except KeyError as error:
@@ -170,6 +175,15 @@ def _override_processing_runner(runner: ProcessingRunner) -> Iterator[None]:
         yield
     finally:
         app.dependency_overrides.pop(get_processing_runner, None)
+
+
+@contextmanager
+def _override_worker_storage(storage: FakeWorkerStorage) -> Iterator[None]:
+    app.dependency_overrides[get_worker_storage] = lambda: storage
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(get_worker_storage, None)
 
 
 def _jpeg_bytes() -> bytes:
@@ -302,6 +316,46 @@ def _create_processed_image_missing_classify_job(
     )
     session.commit()
     return batch.id, image_id, inference_key
+
+
+def _create_processed_image_with_thumbnail(
+    session: Session,
+) -> tuple[UUID, UUID, str]:
+    batch = UploadBatch(
+        organization_id=DEFAULT_ORGANIZATION_ID,
+        status="processing",
+        original_file_count=1,
+        processed_file_count=1,
+        finalized_at=datetime.now(UTC),
+        pipeline_version=PIPELINE_VERSION,
+    )
+    session.add(batch)
+    session.flush()
+
+    image_id = uuid4()
+    thumbnail_key = (
+        f"organizations/{DEFAULT_ORGANIZATION_ID}/batches/{batch.id}/"
+        f"derived/{PIPELINE_VERSION}/{image_id}/thumbnail.jpg"
+    )
+    session.add(
+        ImageAsset(
+            id=image_id,
+            organization_id=DEFAULT_ORGANIZATION_ID,
+            batch_id=batch.id,
+            original_object_key=(
+                f"organizations/{DEFAULT_ORGANIZATION_ID}/batches/{batch.id}/"
+                f"originals/{image_id}.jpg"
+            ),
+            thumbnail_object_key=thumbnail_key,
+            original_filename="processed.jpg",
+            upload_order=0,
+            mime_type=JPEG_CONTENT_TYPE,
+            size_bytes=100,
+            status="processed",
+        )
+    )
+    session.commit()
+    return batch.id, image_id, thumbnail_key
 
 
 async def test_processing_snapshot_is_read_only_for_queued_batch(
@@ -580,3 +634,103 @@ async def test_processing_endpoints_reject_non_finalized_batches(
 
     assert get_response.status_code == 409
     assert post_response.status_code == 409
+
+
+async def test_processing_thumbnail_endpoint_returns_jpeg_with_no_store(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+    fake_worker_storage: FakeWorkerStorage,
+) -> None:
+    thumbnail_bytes = _jpeg_bytes()
+    with Session(migrated_engine) as session:
+        batch_id, image_id, thumbnail_key = _create_processed_image_with_thumbnail(
+            session
+        )
+    fake_worker_storage.objects[thumbnail_key] = StoredObject(
+        data=thumbnail_bytes,
+        content_type=JPEG_CONTENT_TYPE,
+    )
+
+    with _override_worker_storage(fake_worker_storage):
+        response = await database_client.get(
+            f"/v1/upload-batches/{batch_id}/images/{image_id}/thumbnail"
+        )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.content == thumbnail_bytes
+    assert fake_worker_storage.reads == [thumbnail_key]
+
+
+async def test_processing_thumbnail_endpoint_returns_no_store_404s(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+    fake_worker_storage: FakeWorkerStorage,
+) -> None:
+    with Session(migrated_engine) as session:
+        batch_id, image_ids, _ = _create_batch_with_uploaded_images(
+            session,
+            image_count=1,
+        )
+        image_id = image_ids[0]
+        other_batch = UploadBatch(
+            organization_id=DEFAULT_ORGANIZATION_ID,
+            status="processing",
+            original_file_count=0,
+            processed_file_count=0,
+            finalized_at=datetime.now(UTC),
+            pipeline_version=PIPELINE_VERSION,
+        )
+        session.add(other_batch)
+        session.commit()
+        other_batch_id = other_batch.id
+
+    with _override_worker_storage(fake_worker_storage):
+        missing_key_response = await database_client.get(
+            f"/v1/upload-batches/{batch_id}/images/{image_id}/thumbnail"
+        )
+        wrong_batch_response = await database_client.get(
+            f"/v1/upload-batches/{other_batch_id}/images/{image_id}/thumbnail"
+        )
+        missing_batch_response = await database_client.get(
+            f"/v1/upload-batches/{uuid4()}/images/{image_id}/thumbnail"
+        )
+
+    for response in (
+        missing_key_response,
+        wrong_batch_response,
+        missing_batch_response,
+    ):
+        assert response.status_code == 404
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json()["detail"]["code"] == "thumbnail_not_found"
+
+
+async def test_processing_thumbnail_endpoint_maps_storage_failures(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+    fake_worker_storage: FakeWorkerStorage,
+) -> None:
+    with Session(migrated_engine) as session:
+        batch_id, image_id, thumbnail_key = _create_processed_image_with_thumbnail(
+            session
+        )
+    fake_worker_storage.read_error_keys.add(thumbnail_key)
+
+    with _override_worker_storage(fake_worker_storage):
+        read_error_response = await database_client.get(
+            f"/v1/upload-batches/{batch_id}/images/{image_id}/thumbnail"
+        )
+    fake_worker_storage.read_error_keys.clear()
+    with _override_worker_storage(fake_worker_storage):
+        missing_object_response = await database_client.get(
+            f"/v1/upload-batches/{batch_id}/images/{image_id}/thumbnail"
+        )
+
+    assert read_error_response.status_code == 500
+    assert read_error_response.headers["cache-control"] == "no-store"
+    assert read_error_response.json()["detail"]["code"] == "thumbnail_read_failed"
+    assert missing_object_response.status_code == 404
+    assert missing_object_response.headers["cache-control"] == "no-store"
+    assert missing_object_response.json()["detail"]["code"] == "thumbnail_not_found"

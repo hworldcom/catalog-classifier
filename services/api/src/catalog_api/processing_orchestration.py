@@ -43,6 +43,10 @@ from catalog_api.processing_jobs import (
     process_image_task,
 )
 from catalog_api.processing_storage import WorkerStorage, get_worker_storage
+from catalog_api.processing_storage import (
+    WorkerObjectNotFoundError,
+    WorkerObjectReadError,
+)
 from catalog_api.upload_batches import DEFAULT_ORGANIZATION_ID
 
 logger = logging.getLogger(__name__)
@@ -87,6 +91,14 @@ class ProcessingBatchState:
 class ProcessingRunner(Protocol):
     def start(self, *, batch_id: UUID, pipeline_version: str) -> None:
         """Start local processing for a batch and return promptly."""
+
+
+class ProcessingThumbnailNotFoundError(Exception):
+    """Raised when a durable thumbnail is not available."""
+
+
+class ProcessingThumbnailReadError(Exception):
+    """Raised when a durable thumbnail cannot be read due to infrastructure."""
 
 
 class LocalProcessingRunner:
@@ -245,6 +257,40 @@ def get_processing_batch_state(
             for image in images
         ],
     )
+
+
+def read_processing_thumbnail(
+    session: Session,
+    *,
+    batch_id: UUID,
+    image_id: UUID,
+    storage: WorkerStorage,
+) -> bytes:
+    batch = session.scalar(
+        select(UploadBatch.id).where(
+            UploadBatch.id == batch_id,
+            UploadBatch.organization_id == DEFAULT_ORGANIZATION_ID,
+        )
+    )
+    if batch is None:
+        raise ProcessingThumbnailNotFoundError
+
+    thumbnail_object_key = session.scalar(
+        select(ImageAsset.thumbnail_object_key).where(
+            ImageAsset.id == image_id,
+            ImageAsset.batch_id == batch_id,
+            ImageAsset.organization_id == DEFAULT_ORGANIZATION_ID,
+        )
+    )
+    if thumbnail_object_key is None:
+        raise ProcessingThumbnailNotFoundError
+
+    try:
+        return storage.read_object_bytes(object_key=thumbnail_object_key)
+    except WorkerObjectNotFoundError as error:
+        raise ProcessingThumbnailNotFoundError from error
+    except WorkerObjectReadError as error:
+        raise ProcessingThumbnailReadError from error
 
 
 def run_processing_batch(

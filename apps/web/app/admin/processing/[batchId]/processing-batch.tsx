@@ -3,9 +3,11 @@
 import { useEffect, useState } from "react";
 
 import {
+  ProcessingBatchImage,
   ProcessingBatchResult,
   isProcessingBatchTerminal,
   loadProcessingBatch,
+  processingThumbnailUrl,
   startUploadBatchProcessing,
 } from "@/lib/durable-uploads";
 
@@ -25,6 +27,9 @@ export default function ProcessingBatch({
   const [isLoading, setIsLoading] = useState(true);
   const [isStarting, setIsStarting] = useState(false);
   const [hasStartedProcessing, setHasStartedProcessing] = useState(false);
+  const [failedThumbnailKeys, setFailedThumbnailKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
 
   useEffect(() => {
     let isCurrent = true;
@@ -206,6 +211,18 @@ export default function ProcessingBatch({
         {snapshot.images.map((image) => (
           <article className="processing-card" key={image.imageId}>
             <header className="processing-card-header">
+              <ThumbnailPreview
+                batchId={snapshot.batchId}
+                image={image}
+                failedThumbnailKeys={failedThumbnailKeys}
+                onThumbnailError={(thumbnailKey) =>
+                  setFailedThumbnailKeys((currentKeys) => {
+                    const nextKeys = new Set(currentKeys);
+                    nextKeys.add(thumbnailKey);
+                    return nextKeys;
+                  })
+                }
+              />
               <div>
                 <p className="group-label">Image {image.uploadOrder + 1}</p>
                 <h2>{image.originalFilename}</h2>
@@ -261,6 +278,37 @@ export default function ProcessingBatch({
   );
 }
 
+function ThumbnailPreview({
+  batchId,
+  image,
+  failedThumbnailKeys,
+  onThumbnailError,
+}: {
+  batchId: string;
+  image: ProcessingBatchImage;
+  failedThumbnailKeys: Set<string>;
+  onThumbnailError: (thumbnailKey: string) => void;
+}) {
+  const thumbnailKey = thumbnailStateKey(image);
+  const isUnavailable = failedThumbnailKeys.has(thumbnailKey);
+
+  return (
+    <div className="processing-thumbnail">
+      {isUnavailable ? (
+        <div className="thumbnail-placeholder">Thumbnail pending</div>
+      ) : (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          key={thumbnailKey}
+          src={processingThumbnailUrl(batchId, image.imageId)}
+          alt={`Thumbnail for ${image.originalFilename}`}
+          onError={() => onThumbnailError(thumbnailKey)}
+        />
+      )}
+    </div>
+  );
+}
+
 function ProcessingField({
   label,
   value,
@@ -274,6 +322,17 @@ function ProcessingField({
       <dd>{value}</dd>
     </div>
   );
+}
+
+function thumbnailStateKey(image: ProcessingBatchImage): string {
+  return [
+    image.imageId,
+    image.imageStatus,
+    image.processJobStatus ?? "none",
+    image.classifyJobStatus ?? "none",
+    image.hasHashes ? "hashes" : "no-hashes",
+    image.hasEmbedding ? "embedding" : "no-embedding",
+  ].join(":");
 }
 
 function statusClass(status: string): string {

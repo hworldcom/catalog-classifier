@@ -13,6 +13,7 @@ import {
   loadUploadBatch,
   prepareDirectUploads,
   prepareRetryUploads,
+  processingThumbnailUrl,
   reconcileUploadSessionRows,
   registerUploadFiles,
   requestRetryUploads,
@@ -350,6 +351,18 @@ describe("durable upload client", () => {
       2,
       "http://api.example.test/v1/upload-batches/batch-1/start-processing",
       { method: "POST" },
+    );
+  });
+
+  it("derives durable thumbnail URLs from batch and image identifiers", () => {
+    expect(
+      processingThumbnailUrl(
+        "batch-1",
+        "image-1",
+        "http://api.example.test/",
+      ),
+    ).toBe(
+      "http://api.example.test/v1/upload-batches/batch-1/images/image-1/thumbnail",
     );
   });
 

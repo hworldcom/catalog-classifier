@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -83,6 +83,15 @@ describe("ProcessingBatch", () => {
     ).toBeEnabled();
     expect(screen.getByText("front.jpg")).toBeInTheDocument();
     expect(screen.getAllByText("not created")).toHaveLength(2);
+    const thumbnail = screen.getByRole("img", {
+      name: "Thumbnail for front.jpg",
+    });
+    expect(thumbnail).toHaveAttribute(
+      "src",
+      "http://localhost:8000/v1/upload-batches/batch-1/images/image-1/thumbnail",
+    );
+    fireEvent.error(thumbnail);
+    expect(screen.getByText("Thumbnail pending")).toBeInTheDocument();
   });
 
   it("starts processing once, polls state, and renders completed classification", async () => {
@@ -108,18 +117,25 @@ describe("ProcessingBatch", () => {
         processJobStatus: "pending",
       }),
     );
-    render(<ProcessingBatch batchId="batch-1" pollIntervalMs={1} />);
+    render(<ProcessingBatch batchId="batch-1" pollIntervalMs={50} />);
 
     await user.click(await screen.findByRole("button", { name: "Start processing" }));
 
     expect(startUploadBatchProcessingMock).toHaveBeenCalledOnce();
     expect(startUploadBatchProcessingMock).toHaveBeenCalledWith("batch-1");
     expect(await screen.findByText("pending")).toBeInTheDocument();
+    fireEvent.error(
+      screen.getByRole("img", { name: "Thumbnail for front.jpg" }),
+    );
+    expect(screen.getByText("Thumbnail pending")).toBeInTheDocument();
 
     await waitFor(() => {
       expect(loadProcessingBatchMock).toHaveBeenCalledTimes(2);
     });
     expect(await screen.findByText("trousers")).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", { name: "Thumbnail for front.jpg" }),
+    ).toBeInTheDocument();
     expect(screen.getByText("0.95")).toBeInTheDocument();
     expect(screen.getAllByText("yes")).toHaveLength(2);
     expect(

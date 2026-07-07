@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
@@ -51,8 +51,11 @@ from catalog_api.processing_jobs import (
 from catalog_api.processing_orchestration import (
     ProcessingBatchState,
     ProcessingRunner,
+    ProcessingThumbnailNotFoundError,
+    ProcessingThumbnailReadError,
     get_processing_batch_state,
     get_processing_runner,
+    read_processing_thumbnail,
     start_processing_batch,
 )
 from catalog_api.processing_storage import WorkerStorage, get_worker_storage
@@ -83,6 +86,9 @@ from catalog_api.upload_storage import (
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
+
+
+NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 
 
 class UploadFileResult(ApiModel):
@@ -401,6 +407,28 @@ def _processing_batch_state_error() -> HTTPException:
             "code": "invalid_batch_state",
             "message": "Upload batch is not ready for processing.",
         },
+    )
+
+
+def _processing_thumbnail_not_found() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "code": "thumbnail_not_found",
+            "message": "The thumbnail was not found.",
+        },
+        headers=NO_STORE_HEADERS,
+    )
+
+
+def _processing_thumbnail_read_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "code": "thumbnail_read_failed",
+            "message": "Unable to read the thumbnail.",
+        },
+        headers=NO_STORE_HEADERS,
     )
 
 
@@ -732,6 +760,35 @@ def get_durable_upload_batch_processing(
         ) from error
 
     return _processing_batch_response(snapshot)
+
+
+@app.get("/v1/upload-batches/{batch_id}/images/{image_id}/thumbnail")
+def get_durable_upload_batch_thumbnail(
+    batch_id: UUID,
+    image_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+    storage: Annotated[WorkerStorage, Depends(get_worker_storage)],
+) -> Response:
+    try:
+        thumbnail_bytes = read_processing_thumbnail(
+            session,
+            batch_id=batch_id,
+            image_id=image_id,
+            storage=storage,
+        )
+    except ProcessingThumbnailNotFoundError as error:
+        raise _processing_thumbnail_not_found() from error
+    except ProcessingThumbnailReadError as error:
+        raise _processing_thumbnail_read_error() from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _processing_thumbnail_read_error() from error
+
+    return Response(
+        content=thumbnail_bytes,
+        media_type="image/jpeg",
+        headers=NO_STORE_HEADERS,
+    )
 
 
 @app.post(
