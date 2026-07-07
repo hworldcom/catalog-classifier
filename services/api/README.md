@@ -235,6 +235,54 @@ column type support. Application code should use
 `catalog_api.embedding_vectors.image_embedding_vector_type()` for the
 `vector(768)` column type so the embedding dimension stays centralized.
 
+### `categories`
+
+| Column | Type | Null | Default |
+| --- | --- | --- | --- |
+| `id` | `uuid` | no | `gen_random_uuid()` |
+| `organization_id` | `uuid` | yes | none |
+| `parent_id` | `uuid` | yes | none |
+| `slug` | `varchar(100)` | no | none |
+| `name_pl` | `text` | no | none |
+| `name_en` | `text` | no | none |
+| `name_de` | `text` | no | none |
+| `name_vi` | `text` | no | none |
+| `active` | `boolean` | no | `true` |
+
+Ticket `0014a` seeds global category rows with `organization_id = null`:
+`clothing`, `t-shirts`, `hoodies`, `trousers`, `jackets`, and `sportswear`.
+The child categories use `clothing` as their parent. For this prototype, each
+localized name column may use the English label until translations are ready.
+
+The schema enforces:
+
+- unique global slugs with a partial unique index where `organization_id IS NULL`;
+- unique organization-specific slugs with a partial unique index where
+  `organization_id IS NOT NULL`;
+- restricted deletion for referenced organizations and parent categories.
+
+### `image_classifications`
+
+| Column | Type | Null | Default |
+| --- | --- | --- | --- |
+| `id` | `uuid` | no | `gen_random_uuid()` |
+| `organization_id` | `uuid` | no | none |
+| `image_id` | `uuid` | no | none |
+| `category_id` | `uuid` | yes | none |
+| `confidence` | `double precision` | yes | none |
+| `attributes_json` | `jsonb` | no | none |
+| `provider` | `varchar(100)` | no | none |
+| `model` | `varchar(100)` | no | none |
+| `raw_response_json` | `jsonb` | no | none |
+| `pipeline_version` | `varchar(100)` | no | none |
+| `created_at` | timezone-aware timestamp | no | `now()` |
+
+The schema enforces one classification row per organization, image, and pipeline
+version. A null `category_id` represents an `unknown` suggestion. Classification
+rows use an organization-scoped image foreign key from `(organization_id, image_id)`
+to `image_assets`, and a plain nullable `category_id` foreign key to `categories`.
+Confidence must be null or between `0` and `1`.
+
 ## Processing Foundation
 
 Ticket `0011` keeps processing local and explicit. Finalization still returns a
@@ -283,7 +331,8 @@ The worker:
   the longest edge, and a thumbnail JPEG capped at 480 pixels on the longest edge;
 - moves the image from `uploaded` to `processing`, then to `processed` or `failed`;
 - increments `upload_batches.processed_file_count` only once, when the image first
-  reaches a terminal worker result.
+  reaches a terminal worker result;
+- creates and enqueues one `classify-image` job after a successful image result.
 
 Perceptual hashes and embeddings are persisted in the same database transaction as
 the image row update. A repeated successful task delivery is a no-op only when the
@@ -311,6 +360,35 @@ account needs object read access for originals and object create access for deri
 outputs. Real embedding generation uses `google-genai`; the Gemini client reads
 `GEMINI_API_KEY` from the environment. Tests replace this dependency with a fake
 embedding provider.
+
+The local category worker entrypoint is:
+
+```http
+POST /internal/tasks/classify-image
+```
+
+```json
+{
+  "batchId": "uuid",
+  "imageId": "uuid",
+  "pipelineVersion": "2026-06-01"
+}
+```
+
+The category worker loads active global taxonomy rows from PostgreSQL, reads the
+bounded inference JPEG from `image_assets.inference_object_key`, and calls the
+category-suggestion provider through an internal interface. The default real
+provider is Google Gemini through `google-genai`; it reads `GEMINI_API_KEY`, and
+the category model defaults to `gemini-2.5-flash` unless `CATALOG_CATEGORY_MODEL`
+is set.
+
+Classification accepts one primary category only. A valid response with confidence
+at least `0.80` and a slug in the active global taxonomy stores that category.
+Low confidence, missing slug, blank slug, or an unknown slug stores `unknown` as a
+null `category_id`. Malformed JSON, missing confidence, invalid confidence, provider
+failure, or inference-object read failure returns HTTP `500`, marks the classify
+job failed, and persists no classification row. Repeated successful delivery is a
+no-op. The classify worker never changes `upload_batches.processed_file_count`.
 
 ## Default Organization
 
@@ -553,9 +631,10 @@ CATALOG_TEST_DATABASE_URL=postgresql+psycopg://catalog:catalog@localhost:5432/po
 
 The PostgreSQL checks verify upgrade, schema and model alignment, constraints, ordered
 image retrieval, the default organization seed, pgvector extension availability, a
-`vector(768)` SQLAlchemy round trip, image embedding persistence, batch endpoint
-persistence and failure handling, and downgrade with all application tables and
-ticket-managed extensions removed.
+`vector(768)` SQLAlchemy round trip, image embedding persistence, category taxonomy
+seed data, nullable unknown classifications, batch endpoint persistence and failure
+handling, and downgrade with all application tables and ticket-managed extensions
+removed.
 Alembic retains its empty `alembic_version` bookkeeping table.
 
 Verify the real signing configuration without uploading an object:

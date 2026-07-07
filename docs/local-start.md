@@ -91,7 +91,7 @@ Run from `services/api`:
 Expected current migration:
 
 ```text
-0005_hashes_embeddings (head)
+0006_category_schema (head)
 ```
 
 Verify pgvector is enabled in the application database:
@@ -119,6 +119,7 @@ cd /Users/hoangdeveloper/catalog-classifier/services/api
 export CATALOG_UPLOAD_BUCKET=lnlabs-bucket
 export CATALOG_SIGNING_SERVICE_ACCOUNT="catalog-api@catalog-classifier.iam.gserviceaccount.com"
 export GEMINI_API_KEY="<your Gemini API key>"
+# Optional: export CATALOG_CATEGORY_MODEL=gemini-2.5-flash
 .venv/bin/uvicorn catalog_api.main:app --reload --port 8000
 ```
 
@@ -132,11 +133,12 @@ It owns:
 - upload finalization and batch readback;
 - retry signed URL generation;
 - local processing job dispatch;
-- the internal `process-image` worker endpoint.
+- the internal `process-image` worker endpoint;
+- the internal `classify-image` worker endpoint.
 
-The `GEMINI_API_KEY` value is only needed when you run real image embedding
-generation through the worker endpoint. Backend tests replace the embedding provider
-with a fake implementation.
+The `GEMINI_API_KEY` value is only needed when you run real image embedding or
+category suggestion generation through the worker endpoints. Backend tests replace
+the Gemini providers with fake implementations.
 
 There is no separate worker process in the current prototype. The internal worker
 endpoint runs inside this backend process.

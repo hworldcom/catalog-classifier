@@ -13,6 +13,10 @@ from PIL import Image
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
+from catalog_api.category_suggestion_providers import (
+    CategorySuggestionProviderError,
+    get_category_suggestion_provider,
+)
 from catalog_api.embedding_vectors import EMBEDDING_DIMENSIONS
 from catalog_api.image_embedding_providers import (
     ImageEmbeddingProviderError,
@@ -20,11 +24,23 @@ from catalog_api.image_embedding_providers import (
 )
 from catalog_api.image_processing import JPEG_CONTENT_TYPE, derived_image_keys
 from catalog_api.main import app
-from catalog_api.models import ImageAsset, ImageEmbedding, ProcessingJob, UploadBatch
+from catalog_api.models import (
+    Category,
+    ImageAsset,
+    ImageClassification,
+    ImageEmbedding,
+    ProcessingJob,
+    UploadBatch,
+)
 from catalog_api.processing_jobs import (
+    CLASSIFY_IMAGE_JOB_TYPE,
+    PROCESS_IMAGE_JOB_TYPE,
+    ClassifyImageTaskPayload,
     InMemoryProcessingQueue,
     ProcessingBatchStateError,
     claim_batch_for_processing,
+    classify_image_idempotency_key,
+    get_processing_queue,
     process_image_idempotency_key,
 )
 from catalog_api.processing_storage import (
@@ -104,6 +120,31 @@ class FakeImageEmbeddingProvider:
         return self.embedding
 
 
+class FakeCategorySuggestionProvider:
+    provider = "fake-provider"
+    model = "fake-category-suggestion"
+
+    def __init__(self) -> None:
+        self.response: str | dict[str, object] = {
+            "categorySlug": "t-shirts",
+            "confidence": 0.91,
+        }
+        self.fail = False
+        self.calls: list[tuple[bytes, str, list[str]]] = []
+
+    def suggest_category(
+        self,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        category_slugs: list[str],
+    ) -> str | dict[str, object]:
+        self.calls.append((image_bytes, mime_type, list(category_slugs)))
+        if self.fail:
+            raise CategorySuggestionProviderError("fake provider failure")
+        return self.response
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
@@ -117,6 +158,26 @@ def fake_image_embedding_provider() -> Iterator[FakeImageEmbeddingProvider]:
         yield provider
     finally:
         app.dependency_overrides.pop(get_image_embedding_provider, None)
+
+
+@pytest.fixture(autouse=True)
+def fake_category_suggestion_provider() -> Iterator[FakeCategorySuggestionProvider]:
+    provider = FakeCategorySuggestionProvider()
+    app.dependency_overrides[get_category_suggestion_provider] = lambda: provider
+    try:
+        yield provider
+    finally:
+        app.dependency_overrides.pop(get_category_suggestion_provider, None)
+
+
+@pytest.fixture(autouse=True)
+def fake_processing_queue() -> Iterator[InMemoryProcessingQueue]:
+    queue = InMemoryProcessingQueue()
+    app.dependency_overrides[get_processing_queue] = lambda: queue
+    try:
+        yield queue
+    finally:
+        app.dependency_overrides.pop(get_processing_queue, None)
 
 
 @pytest.fixture
@@ -216,6 +277,88 @@ def _claim_single_image(
         )
     payload = claim.enqueued_tasks[0]
     return payload.batch_id, payload.image_id
+
+
+def _create_processed_image_with_classify_job(
+    session: Session,
+) -> tuple[UUID, UUID, str]:
+    batch = UploadBatch(
+        organization_id=DEFAULT_ORGANIZATION_ID,
+        status="processing",
+        original_file_count=1,
+        processed_file_count=1,
+        finalized_at=datetime.now(UTC),
+        pipeline_version=PIPELINE_VERSION,
+    )
+    session.add(batch)
+    session.flush()
+
+    image_id = uuid4()
+    inference_key = (
+        f"organizations/{DEFAULT_ORGANIZATION_ID}/batches/{batch.id}/"
+        f"derived/{PIPELINE_VERSION}/{image_id}/inference.jpg"
+    )
+    session.add(
+        ImageAsset(
+            id=image_id,
+            organization_id=DEFAULT_ORGANIZATION_ID,
+            batch_id=batch.id,
+            original_object_key=(
+                f"organizations/{DEFAULT_ORGANIZATION_ID}/batches/{batch.id}/"
+                f"originals/{image_id}.jpg"
+            ),
+            normalized_object_key=(
+                f"organizations/{DEFAULT_ORGANIZATION_ID}/batches/{batch.id}/"
+                f"derived/{PIPELINE_VERSION}/{image_id}/normalized.jpg"
+            ),
+            inference_object_key=inference_key,
+            thumbnail_object_key=(
+                f"organizations/{DEFAULT_ORGANIZATION_ID}/batches/{batch.id}/"
+                f"derived/{PIPELINE_VERSION}/{image_id}/thumbnail.jpg"
+            ),
+            original_filename="processed.jpg",
+            upload_order=0,
+            mime_type="image/jpeg",
+            size_bytes=100,
+            width=100,
+            height=100,
+            normalized_format=JPEG_CONTENT_TYPE,
+            normalized_size_bytes=100,
+            sha256="0" * 64,
+            phash="0" * 16,
+            dhash="1" * 16,
+            status="processed",
+        )
+    )
+    session.add(
+        ProcessingJob(
+            organization_id=DEFAULT_ORGANIZATION_ID,
+            batch_id=batch.id,
+            image_id=image_id,
+            job_type=CLASSIFY_IMAGE_JOB_TYPE,
+            pipeline_version=PIPELINE_VERSION,
+            idempotency_key=classify_image_idempotency_key(
+                image_id=image_id,
+                pipeline_version=PIPELINE_VERSION,
+            ),
+        )
+    )
+    session.commit()
+    return batch.id, image_id, inference_key
+
+
+def _process_image_job_query(image_id: UUID):
+    return select(ProcessingJob).where(
+        ProcessingJob.image_id == image_id,
+        ProcessingJob.job_type == PROCESS_IMAGE_JOB_TYPE,
+    )
+
+
+def _classify_image_job_query(image_id: UUID):
+    return select(ProcessingJob).where(
+        ProcessingJob.image_id == image_id,
+        ProcessingJob.job_type == CLASSIFY_IMAGE_JOB_TYPE,
+    )
 
 
 async def test_claim_batch_creates_processing_jobs_and_queue_payloads(
@@ -350,6 +493,7 @@ async def test_process_image_worker_creates_derivatives_and_is_idempotent(
     migrated_engine: Engine,
     fake_worker_storage: FakeWorkerStorage,
     fake_image_embedding_provider: FakeImageEmbeddingProvider,
+    fake_processing_queue: InMemoryProcessingQueue,
 ) -> None:
     original_bytes = _jpeg_bytes(size=(1200, 600))
     with Session(migrated_engine) as session:
@@ -387,6 +531,13 @@ async def test_process_image_worker_creates_derivatives_and_is_idempotent(
         "jobStatus": "completed",
         "didWork": True,
     }
+    assert fake_processing_queue.classify_image_tasks == [
+        ClassifyImageTaskPayload(
+            batch_id=batch_id,
+            image_id=image_id,
+            pipeline_version=PIPELINE_VERSION,
+        )
+    ]
     assert fake_worker_storage.reads == [object_keys[0]]
     assert [write[0] for write in fake_worker_storage.writes] == [
         expected_keys.normalized_object_key,
@@ -416,8 +567,9 @@ async def test_process_image_worker_creates_derivatives_and_is_idempotent(
     with Session(migrated_engine) as session:
         batch = session.get(UploadBatch, batch_id)
         job = session.scalar(
-            select(ProcessingJob).where(ProcessingJob.image_id == image_id)
+            _process_image_job_query(image_id)
         )
+        classify_job = session.scalar(_classify_image_job_query(image_id))
         image = session.get(ImageAsset, image_id)
         embedding = session.scalar(
             select(ImageEmbedding).where(ImageEmbedding.image_id == image_id)
@@ -431,6 +583,13 @@ async def test_process_image_worker_creates_derivatives_and_is_idempotent(
     assert job.started_at is not None
     assert job.completed_at is not None
     assert job.error_message is None
+    assert classify_job is not None
+    assert classify_job.status == "pending"
+    assert classify_job.job_type == CLASSIFY_IMAGE_JOB_TYPE
+    assert classify_job.idempotency_key == classify_image_idempotency_key(
+        image_id=image_id,
+        pipeline_version=PIPELINE_VERSION,
+    )
     assert image is not None
     assert image.status == "processed"
     assert image.sha256 == sha256(original_bytes).hexdigest()
@@ -475,10 +634,11 @@ async def test_process_image_worker_creates_derivatives_and_is_idempotent(
     assert redelivery_response.json()["didWork"] is False
     assert len(fake_worker_storage.writes) == write_count
     assert len(fake_image_embedding_provider.calls) == embedding_call_count
+    assert len(fake_processing_queue.classify_image_tasks) == 1
     with Session(migrated_engine) as session:
         redelivered_batch = session.get(UploadBatch, batch_id)
         redelivered_job = session.scalar(
-            select(ProcessingJob).where(ProcessingJob.image_id == image_id)
+            _process_image_job_query(image_id)
         )
         embedding_count = session.scalar(
             select(func.count())
@@ -540,6 +700,262 @@ async def test_process_image_applies_exif_orientation_to_derivatives_only(
     assert image.sha256 == sha256(original_bytes).hexdigest()
 
 
+async def test_classify_image_worker_persists_known_category_and_is_idempotent(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+    fake_worker_storage: FakeWorkerStorage,
+    fake_category_suggestion_provider: FakeCategorySuggestionProvider,
+) -> None:
+    inference_bytes = _jpeg_bytes(size=(320, 240))
+    with Session(migrated_engine) as session:
+        batch_id, image_id, inference_key = _create_processed_image_with_classify_job(
+            session
+        )
+    fake_worker_storage.objects[inference_key] = StoredObject(
+        data=inference_bytes,
+        content_type=JPEG_CONTENT_TYPE,
+    )
+
+    response = await database_client.post(
+        "/internal/tasks/classify-image",
+        json={
+            "batchId": str(batch_id),
+            "imageId": str(image_id),
+            "pipelineVersion": PIPELINE_VERSION,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "batchId": str(batch_id),
+        "imageId": str(image_id),
+        "pipelineVersion": PIPELINE_VERSION,
+        "jobStatus": "completed",
+        "didWork": True,
+    }
+    assert fake_worker_storage.reads == [inference_key]
+    assert fake_category_suggestion_provider.calls == [
+        (
+            inference_bytes,
+            JPEG_CONTENT_TYPE,
+            [
+                "clothing",
+                "hoodies",
+                "jackets",
+                "sportswear",
+                "t-shirts",
+                "trousers",
+            ],
+        )
+    ]
+
+    with Session(migrated_engine) as session:
+        batch = session.get(UploadBatch, batch_id)
+        category = session.scalar(select(Category).where(Category.slug == "t-shirts"))
+        job = session.scalar(_classify_image_job_query(image_id))
+        classification = session.scalar(
+            select(ImageClassification).where(
+                ImageClassification.image_id == image_id
+            )
+        )
+
+    assert batch is not None
+    assert batch.processed_file_count == 1
+    assert category is not None
+    assert job is not None
+    assert job.status == "completed"
+    assert job.attempt_count == 1
+    assert job.completed_at is not None
+    assert job.error_message is None
+    assert classification is not None
+    assert classification.organization_id == DEFAULT_ORGANIZATION_ID
+    assert classification.category_id == category.id
+    assert classification.confidence == pytest.approx(0.91)
+    assert classification.attributes_json == {
+        "categorySlug": "t-shirts",
+        "confidence": 0.91,
+    }
+    assert classification.raw_response_json == {
+        "categorySlug": "t-shirts",
+        "confidence": 0.91,
+    }
+    assert classification.provider == fake_category_suggestion_provider.provider
+    assert classification.model == fake_category_suggestion_provider.model
+    assert classification.pipeline_version == PIPELINE_VERSION
+
+    provider_call_count = len(fake_category_suggestion_provider.calls)
+    redelivery_response = await database_client.post(
+        "/internal/tasks/classify-image",
+        json={
+            "batchId": str(batch_id),
+            "imageId": str(image_id),
+            "pipelineVersion": PIPELINE_VERSION,
+        },
+    )
+
+    assert redelivery_response.status_code == 200
+    assert redelivery_response.json()["didWork"] is False
+    assert len(fake_category_suggestion_provider.calls) == provider_call_count
+    with Session(migrated_engine) as session:
+        classification_count = session.scalar(
+            select(func.count())
+            .select_from(ImageClassification)
+            .where(ImageClassification.image_id == image_id)
+        )
+        redelivered_job = session.scalar(_classify_image_job_query(image_id))
+        redelivered_batch = session.get(UploadBatch, batch_id)
+
+    assert classification_count == 1
+    assert redelivered_job is not None
+    assert redelivered_job.attempt_count == 1
+    assert redelivered_batch is not None
+    assert redelivered_batch.processed_file_count == 1
+
+
+@pytest.mark.parametrize(
+    "provider_response",
+    [
+        {"categorySlug": "t-shirts", "confidence": 0.79},
+        {"confidence": 0.91},
+        {"categorySlug": "", "confidence": 0.91},
+        {"categorySlug": "scarves", "confidence": 0.91},
+    ],
+)
+async def test_classify_image_worker_persists_unknown_fallback(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+    fake_worker_storage: FakeWorkerStorage,
+    fake_category_suggestion_provider: FakeCategorySuggestionProvider,
+    provider_response: dict[str, object],
+) -> None:
+    with Session(migrated_engine) as session:
+        batch_id, image_id, inference_key = _create_processed_image_with_classify_job(
+            session
+        )
+    fake_worker_storage.objects[inference_key] = StoredObject(
+        data=_jpeg_bytes(size=(320, 240)),
+        content_type=JPEG_CONTENT_TYPE,
+    )
+    fake_category_suggestion_provider.response = provider_response
+
+    response = await database_client.post(
+        "/internal/tasks/classify-image",
+        json={
+            "batchId": str(batch_id),
+            "imageId": str(image_id),
+            "pipelineVersion": PIPELINE_VERSION,
+        },
+    )
+
+    assert response.status_code == 200
+    with Session(migrated_engine) as session:
+        classification = session.scalar(
+            select(ImageClassification).where(
+                ImageClassification.image_id == image_id
+            )
+        )
+
+    assert classification is not None
+    assert classification.category_id is None
+    assert classification.confidence == pytest.approx(
+        float(provider_response["confidence"])
+    )
+    assert classification.attributes_json == {
+        "categorySlug": "unknown",
+        "confidence": float(provider_response["confidence"]),
+    }
+    assert classification.raw_response_json == provider_response
+
+
+@pytest.mark.parametrize(
+    ("provider_response", "provider_fails"),
+    [
+        ('{"categorySlug": "t-shirts",', False),
+        ({"categorySlug": "t-shirts"}, False),
+        ({"categorySlug": "t-shirts", "confidence": "high"}, False),
+        ({"categorySlug": "t-shirts", "confidence": 1.1}, False),
+        ({"categorySlug": "t-shirts", "confidence": 0.91}, True),
+    ],
+)
+async def test_classify_image_failures_are_retryable_without_partial_rows(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+    fake_worker_storage: FakeWorkerStorage,
+    fake_category_suggestion_provider: FakeCategorySuggestionProvider,
+    provider_response: str | dict[str, object],
+    provider_fails: bool,
+) -> None:
+    with Session(migrated_engine) as session:
+        batch_id, image_id, inference_key = _create_processed_image_with_classify_job(
+            session
+        )
+    fake_worker_storage.objects[inference_key] = StoredObject(
+        data=_jpeg_bytes(size=(320, 240)),
+        content_type=JPEG_CONTENT_TYPE,
+    )
+    fake_category_suggestion_provider.response = provider_response
+    fake_category_suggestion_provider.fail = provider_fails
+
+    response = await database_client.post(
+        "/internal/tasks/classify-image",
+        json={
+            "batchId": str(batch_id),
+            "imageId": str(image_id),
+            "pipelineVersion": PIPELINE_VERSION,
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "category_suggestion_failed"
+    with Session(migrated_engine) as session:
+        batch = session.get(UploadBatch, batch_id)
+        job = session.scalar(_classify_image_job_query(image_id))
+        classifications = session.scalars(
+            select(ImageClassification).where(
+                ImageClassification.image_id == image_id
+            )
+        ).all()
+
+    assert batch is not None
+    assert batch.processed_file_count == 1
+    assert job is not None
+    assert job.status == "failed"
+    assert job.attempt_count == 1
+    assert "category_suggestion_failed" in (job.error_message or "")
+    assert classifications == []
+
+    fake_category_suggestion_provider.fail = False
+    fake_category_suggestion_provider.response = {
+        "categorySlug": "t-shirts",
+        "confidence": 0.91,
+    }
+    retry_response = await database_client.post(
+        "/internal/tasks/classify-image",
+        json={
+            "batchId": str(batch_id),
+            "imageId": str(image_id),
+            "pipelineVersion": PIPELINE_VERSION,
+        },
+    )
+
+    assert retry_response.status_code == 200
+    with Session(migrated_engine) as session:
+        retried_job = session.scalar(_classify_image_job_query(image_id))
+        classification_count = session.scalar(
+            select(func.count())
+            .select_from(ImageClassification)
+            .where(ImageClassification.image_id == image_id)
+        )
+        retried_batch = session.get(UploadBatch, batch_id)
+
+    assert retried_job is not None
+    assert retried_job.status == "completed"
+    assert retried_job.attempt_count == 2
+    assert classification_count == 1
+    assert retried_batch is not None
+    assert retried_batch.processed_file_count == 1
+
+
 @pytest.mark.parametrize(
     ("source_bytes", "expected_error_code"),
     [
@@ -582,7 +998,7 @@ async def test_terminal_image_failures_do_not_retry_or_duplicate_counters(
     with Session(migrated_engine) as session:
         batch = session.get(UploadBatch, batch_id)
         job = session.scalar(
-            select(ProcessingJob).where(ProcessingJob.image_id == image_id)
+            _process_image_job_query(image_id)
         )
         image = session.get(ImageAsset, image_id)
     assert batch is not None
@@ -610,7 +1026,7 @@ async def test_terminal_image_failures_do_not_retry_or_duplicate_counters(
     with Session(migrated_engine) as session:
         redelivered_batch = session.get(UploadBatch, batch_id)
         redelivered_job = session.scalar(
-            select(ProcessingJob).where(ProcessingJob.image_id == image_id)
+            _process_image_job_query(image_id)
         )
     assert redelivered_batch is not None
     assert redelivered_batch.processed_file_count == 1
@@ -686,7 +1102,7 @@ async def test_retryable_read_failure_returns_500_without_terminal_counter(
     with Session(migrated_engine) as session:
         batch = session.get(UploadBatch, batch_id)
         job = session.scalar(
-            select(ProcessingJob).where(ProcessingJob.image_id == image_id)
+            _process_image_job_query(image_id)
         )
         image = session.get(ImageAsset, image_id)
     assert batch is not None
@@ -712,7 +1128,7 @@ async def test_retryable_read_failure_returns_500_without_terminal_counter(
     with Session(migrated_engine) as session:
         retried_batch = session.get(UploadBatch, batch_id)
         retried_job = session.scalar(
-            select(ProcessingJob).where(ProcessingJob.image_id == image_id)
+            _process_image_job_query(image_id)
         )
     assert retried_batch is not None
     assert retried_batch.processed_file_count == 1
@@ -760,7 +1176,7 @@ async def test_retryable_write_failure_returns_500_and_can_reuse_keys(
     with Session(migrated_engine) as session:
         batch = session.get(UploadBatch, batch_id)
         job = session.scalar(
-            select(ProcessingJob).where(ProcessingJob.image_id == image_id)
+            _process_image_job_query(image_id)
         )
         image = session.get(ImageAsset, image_id)
     assert batch is not None
@@ -787,7 +1203,7 @@ async def test_retryable_write_failure_returns_500_and_can_reuse_keys(
         retried_batch = session.get(UploadBatch, batch_id)
         retried_image = session.get(ImageAsset, image_id)
         retried_job = session.scalar(
-            select(ProcessingJob).where(ProcessingJob.image_id == image_id)
+            _process_image_job_query(image_id)
         )
     assert retried_batch is not None
     assert retried_batch.processed_file_count == 1
@@ -844,7 +1260,7 @@ async def test_embedding_failures_are_retryable_without_partial_rows(
     with Session(migrated_engine) as session:
         batch = session.get(UploadBatch, batch_id)
         job = session.scalar(
-            select(ProcessingJob).where(ProcessingJob.image_id == image_id)
+            _process_image_job_query(image_id)
         )
         image = session.get(ImageAsset, image_id)
         embeddings = session.scalars(
@@ -882,7 +1298,7 @@ async def test_embedding_failures_are_retryable_without_partial_rows(
     with Session(migrated_engine) as session:
         retried_batch = session.get(UploadBatch, batch_id)
         retried_job = session.scalar(
-            select(ProcessingJob).where(ProcessingJob.image_id == image_id)
+            _process_image_job_query(image_id)
         )
         retried_image = session.get(ImageAsset, image_id)
         embedding_count = session.scalar(

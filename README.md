@@ -439,31 +439,29 @@ embedding provider rather than calling Gemini.
 
 ### Stage E: Category classification
 
-Classify each image against a closed category taxonomy.
+Classify each image into one primary category against a closed category taxonomy.
 
 The model must return structured JSON:
 
 ```json
 {
-  "categoryId": "tshirts",
-  "confidence": 0.91,
-  "attributes": {
-    "productType": "t-shirt",
-    "audience": "men",
-    "dominantColor": "black"
-  }
+  "categorySlug": "t-shirts",
+  "confidence": 0.91
 }
 ```
 
 Rules:
 
-* Category IDs must come from the database taxonomy.
+* Category slugs must come from the database taxonomy.
 * Never let the model invent a category slug.
-* Use `unknown` when confidence is insufficient.
+* Use `unknown` when confidence is below `0.80`, the slug is missing, or the
+  category is not in the active global taxonomy.
+* Store `unknown` as a null `category_id` in `image_classifications`.
 * Store the raw model response for debugging.
 * Category classification is a suggestion until approved.
+* Malformed JSON or provider failures are retryable and do not persist a row.
 
-Initial categories might include:
+Initial seeded categories include:
 
 ```text
 clothing
@@ -475,6 +473,11 @@ clothing
 ```
 
 The taxonomy must be editable without changing model code.
+The prototype implementation uses Google Gemini through `google-genai` behind
+an internal category-suggestion provider interface and reads `GEMINI_API_KEY`
+from the worker environment. The category model defaults to `gemini-2.5-flash`
+and can be overridden with `CATALOG_CATEGORY_MODEL`. Automated tests use a fake
+provider rather than calling Gemini.
 
 ### Stage F: Candidate-pair generation
 
@@ -751,12 +754,17 @@ name_vi
 active
 ```
 
+Seeded categories are global rows with `organization_id = null`. Global slugs are
+unique through a partial unique index for rows where `organization_id` is null.
+Organization-specific rows may be added later without changing model code.
+
 #### `image_classifications`
 
 ```text
 id
+organization_id
 image_id
-category_id
+category_id nullable
 confidence
 attributes_json
 provider
@@ -765,6 +773,14 @@ raw_response_json
 pipeline_version
 created_at
 ```
+
+The schema enforces one classification row per organization, image, and
+pipeline version. The classification row uses an organization-scoped foreign key
+from `(organization_id, image_id)` to the image row. A null `category_id`
+represents an `unknown` suggestion.
+The `attributes_json` column stores the structured classification payload for
+this slice, which currently contains the category slug and confidence.
+`raw_response_json` stores the unmodified provider response for debugging.
 
 #### `pair_assessments`
 
@@ -898,8 +914,8 @@ POST /internal/tasks/find-existing-products
 ```
 
 Milestone 2 prototype work uses a local fake queue and the local `process-image`
-worker. Ticket `0016` adds Cloud Tasks and authenticated service-to-service worker
-requests for production hardening.
+and `classify-image` workers. Ticket `0016` adds Cloud Tasks and authenticated
+service-to-service worker requests for production hardening.
 
 In production, these endpoints must require authenticated service-to-service
 requests. They must not be publicly callable.
@@ -937,6 +953,10 @@ Do not send image bytes through the task payload. Send only identifiers such as:
 ```
 
 The worker retrieves the image from Cloud Storage.
+
+When a `process-image` job completes successfully for an image, enqueue one
+`classify-image` job for the same image. Protect this with a database
+constraint or idempotency key so it is created only once.
 
 When all image-level jobs are complete, enqueue one batch-grouping job. Protect this with a database constraint or idempotency key so that it is created only once.
 
@@ -1487,14 +1507,17 @@ Keep this milestone narrow and vertical:
 3. Add pgvector storage foundation in ticket `0013a`.
 4. Finalize successful direct browser uploads from the frontend in ticket `0013b`.
 5. Generate perceptual hashes and embeddings in ticket `0013c`.
-6. Write category suggestions.
-7. Add the read-only processing page with polling.
+6. Add the category taxonomy and classification schema in ticket `0014a`.
+7. Write category suggestions in ticket `0014b`.
+8. Add the start-processing endpoint in ticket `0015a`.
+9. Add the read-only processing page with polling in ticket `0015b`.
 
 Milestone 2 ends with per-image processing data persisted in the database and a
 read-only page that shows it. Grouping and review remain in Milestone 3.
 
-Prototype work uses a local fake queue. Cloud Tasks integration and worker
-authentication are deferred to a later hardening ticket.
+Prototype work uses a local fake queue and the local `process-image` and
+`classify-image` workers. Cloud Tasks integration and worker authentication are
+deferred to a later hardening ticket.
 
 ### Milestone 3: Grouping and review
 

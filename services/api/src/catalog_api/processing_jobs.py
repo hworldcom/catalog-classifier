@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from catalog_api.category_suggestion_providers import (
+    CategorySuggestionProvider,
+    CategorySuggestionProviderError,
+    CategorySuggestionResult,
+    generate_category_suggestion,
+)
 from catalog_api.embedding_vectors import EMBEDDING_DIMENSIONS
 from catalog_api.image_embedding_providers import (
     ImageEmbeddingResult,
@@ -22,7 +29,14 @@ from catalog_api.image_processing import (
     derived_image_keys,
     process_original_image,
 )
-from catalog_api.models import ImageAsset, ImageEmbedding, ProcessingJob, UploadBatch
+from catalog_api.models import (
+    Category,
+    ImageAsset,
+    ImageClassification,
+    ImageEmbedding,
+    ProcessingJob,
+    UploadBatch,
+)
 from catalog_api.processing_storage import (
     WorkerObjectNotFoundError,
     WorkerObjectReadError,
@@ -32,6 +46,8 @@ from catalog_api.processing_storage import (
 from catalog_api.upload_batches import DEFAULT_ORGANIZATION_ID
 
 PROCESS_IMAGE_JOB_TYPE = "process-image"
+CLASSIFY_IMAGE_JOB_TYPE = "classify-image"
+CLASSIFICATION_CONFIDENCE_THRESHOLD = 0.80
 TERMINAL_IMAGE_STATUSES = {"processed", "failed"}
 
 
@@ -61,17 +77,36 @@ class ProcessImageTaskPayload:
     pipeline_version: str
 
 
+@dataclass(frozen=True)
+class ClassifyImageTaskPayload:
+    batch_id: UUID
+    image_id: UUID
+    pipeline_version: str
+
+
 class ProcessingQueue(Protocol):
     def enqueue_process_image(self, payload: ProcessImageTaskPayload) -> None:
         """Enqueue a process-image task."""
+
+    def enqueue_classify_image(self, payload: ClassifyImageTaskPayload) -> None:
+        """Enqueue a classify-image task."""
 
 
 class InMemoryProcessingQueue:
     def __init__(self) -> None:
         self.process_image_tasks: list[ProcessImageTaskPayload] = []
+        self.classify_image_tasks: list[ClassifyImageTaskPayload] = []
 
     def enqueue_process_image(self, payload: ProcessImageTaskPayload) -> None:
         self.process_image_tasks.append(payload)
+
+    def enqueue_classify_image(self, payload: ClassifyImageTaskPayload) -> None:
+        self.classify_image_tasks.append(payload)
+
+
+@lru_cache
+def get_processing_queue() -> ProcessingQueue:
+    return InMemoryProcessingQueue()
 
 
 @dataclass(frozen=True)
@@ -99,12 +134,29 @@ class ProcessImageTaskResult:
     did_work: bool
 
 
+@dataclass(frozen=True)
+class ClassifyImageTaskResult:
+    batch_id: UUID
+    image_id: UUID
+    pipeline_version: str
+    job_status: str
+    did_work: bool
+
+
 def process_image_idempotency_key(
     *,
     image_id: UUID,
     pipeline_version: str,
 ) -> str:
     return f"{PROCESS_IMAGE_JOB_TYPE}:{image_id}:{pipeline_version}"
+
+
+def classify_image_idempotency_key(
+    *,
+    image_id: UUID,
+    pipeline_version: str,
+) -> str:
+    return f"{CLASSIFY_IMAGE_JOB_TYPE}:{image_id}:{pipeline_version}"
 
 
 def claim_batch_for_processing(
@@ -219,6 +271,7 @@ def process_image_task(
     payload: ProcessImageTaskPayload,
     storage: WorkerStorage,
     embedding_provider: ImageEmbeddingProvider,
+    queue: ProcessingQueue,
 ) -> ProcessImageTaskResult:
     job = session.scalar(
         select(ProcessingJob)
@@ -461,11 +514,18 @@ def process_image_task(
         pipeline_version=payload.pipeline_version,
         embedding_result=embedding_result,
     )
+    classify_task = _ensure_classify_image_job(
+        session,
+        image=image,
+        pipeline_version=payload.pipeline_version,
+    )
     job.status = "completed"
     job.completed_at = datetime.now(UTC)
     job.error_message = None
     _increment_processed_count_once(batch=batch, was_terminal=was_terminal)
     session.commit()
+    if classify_task is not None:
+        queue.enqueue_classify_image(classify_task)
 
     return ProcessImageTaskResult(
         batch_id=payload.batch_id,
@@ -474,6 +534,184 @@ def process_image_task(
         job_status="completed",
         did_work=True,
     )
+
+
+def classify_image_task(
+    session: Session,
+    *,
+    payload: ClassifyImageTaskPayload,
+    storage: WorkerStorage,
+    category_provider: CategorySuggestionProvider,
+) -> ClassifyImageTaskResult:
+    job = session.scalar(
+        select(ProcessingJob)
+        .where(
+            ProcessingJob.batch_id == payload.batch_id,
+            ProcessingJob.image_id == payload.image_id,
+            ProcessingJob.organization_id == DEFAULT_ORGANIZATION_ID,
+            ProcessingJob.job_type == CLASSIFY_IMAGE_JOB_TYPE,
+            ProcessingJob.pipeline_version == payload.pipeline_version,
+            ProcessingJob.idempotency_key
+            == classify_image_idempotency_key(
+                image_id=payload.image_id,
+                pipeline_version=payload.pipeline_version,
+            ),
+        )
+        .with_for_update()
+    )
+    if job is None:
+        raise ProcessingJobNotFoundError
+
+    image = session.scalar(
+        select(ImageAsset)
+        .where(
+            ImageAsset.id == payload.image_id,
+            ImageAsset.batch_id == payload.batch_id,
+            ImageAsset.organization_id == DEFAULT_ORGANIZATION_ID,
+        )
+        .with_for_update()
+    )
+    if image is None:
+        raise ProcessingJobNotFoundError
+
+    if _image_has_classification(
+        session,
+        image=image,
+        pipeline_version=payload.pipeline_version,
+    ):
+        job.status = "completed"
+        job.completed_at = job.completed_at or datetime.now(UTC)
+        job.error_message = None
+        session.commit()
+        return ClassifyImageTaskResult(
+            batch_id=payload.batch_id,
+            image_id=payload.image_id,
+            pipeline_version=payload.pipeline_version,
+            job_status="completed",
+            did_work=False,
+        )
+
+    if image.status != "processed" or image.inference_object_key is None:
+        raise ProcessingJobExecutionError(
+            error_code="invalid_image_state",
+            message="Image is not ready for category classification.",
+        )
+
+    job.status = "started"
+    job.started_at = datetime.now(UTC)
+    job.completed_at = None
+    job.error_message = None
+    job.attempt_count += 1
+
+    try:
+        inference_bytes = storage.read_object_bytes(
+            object_key=image.inference_object_key
+        )
+    except (WorkerObjectNotFoundError, WorkerObjectReadError) as error:
+        _mark_retryable_job_failure(
+            job=job,
+            error_code="classification_input_read_failed",
+            error_message="The inference image could not be read.",
+        )
+        session.commit()
+        raise ProcessingJobExecutionError(
+            error_code="classification_input_read_failed",
+            message="The inference image could not be read.",
+        ) from error
+
+    taxonomy = _load_active_global_taxonomy(session)
+    try:
+        suggestion = generate_category_suggestion(
+            category_provider,
+            image_bytes=inference_bytes,
+            category_slugs=sorted(taxonomy),
+            mime_type=JPEG_CONTENT_TYPE,
+        )
+    except CategorySuggestionProviderError as error:
+        _mark_retryable_job_failure(
+            job=job,
+            error_code="category_suggestion_failed",
+            error_message="The category suggestion could not be generated.",
+        )
+        session.commit()
+        raise ProcessingJobExecutionError(
+            error_code="category_suggestion_failed",
+            message="The category suggestion could not be generated.",
+        ) from error
+
+    category_id = _accepted_category_id(
+        suggestion=suggestion,
+        taxonomy=taxonomy,
+    )
+    persisted_slug = (
+        suggestion.category_slug
+        if category_id is not None and suggestion.category_slug is not None
+        else "unknown"
+    )
+    session.add(
+        ImageClassification(
+            organization_id=image.organization_id,
+            image_id=image.id,
+            category_id=category_id,
+            confidence=suggestion.confidence,
+            attributes_json={
+                "categorySlug": persisted_slug,
+                "confidence": suggestion.confidence,
+            },
+            provider=suggestion.provider,
+            model=suggestion.model,
+            raw_response_json=suggestion.raw_response,
+            pipeline_version=payload.pipeline_version,
+        )
+    )
+    job.status = "completed"
+    job.completed_at = datetime.now(UTC)
+    job.error_message = None
+    session.commit()
+
+    return ClassifyImageTaskResult(
+        batch_id=payload.batch_id,
+        image_id=payload.image_id,
+        pipeline_version=payload.pipeline_version,
+        job_status="completed",
+        did_work=True,
+    )
+
+
+def _ensure_classify_image_job(
+    session: Session,
+    *,
+    image: ImageAsset,
+    pipeline_version: str,
+) -> ClassifyImageTaskPayload | None:
+    idempotency_key = classify_image_idempotency_key(
+        image_id=image.id,
+        pipeline_version=pipeline_version,
+    )
+    existing_job = session.scalar(
+        select(ProcessingJob)
+        .where(ProcessingJob.idempotency_key == idempotency_key)
+        .with_for_update()
+    )
+    if existing_job is not None:
+        return None
+
+    task = ClassifyImageTaskPayload(
+        batch_id=image.batch_id,
+        image_id=image.id,
+        pipeline_version=pipeline_version,
+    )
+    session.add(
+        ProcessingJob(
+            organization_id=image.organization_id,
+            batch_id=image.batch_id,
+            image_id=image.id,
+            job_type=CLASSIFY_IMAGE_JOB_TYPE,
+            pipeline_version=pipeline_version,
+            idempotency_key=idempotency_key,
+        )
+    )
+    return task
 
 
 def _mark_terminal_image_failure(
@@ -507,6 +745,16 @@ def _mark_retryable_worker_failure(
     job.error_message = f"{error_code}: {error_message}"
 
 
+def _mark_retryable_job_failure(
+    *,
+    job: ProcessingJob,
+    error_code: str,
+    error_message: str,
+) -> None:
+    job.status = "failed"
+    job.error_message = f"{error_code}: {error_message}"
+
+
 def _increment_processed_count_once(
     *,
     batch: UploadBatch,
@@ -536,6 +784,46 @@ def _image_has_completed_pipeline_outputs(
         .with_for_update()
     )
     return embedding is not None
+
+
+def _image_has_classification(
+    session: Session,
+    *,
+    image: ImageAsset,
+    pipeline_version: str,
+) -> bool:
+    classification = session.scalar(
+        select(ImageClassification)
+        .where(
+            ImageClassification.organization_id == image.organization_id,
+            ImageClassification.image_id == image.id,
+            ImageClassification.pipeline_version == pipeline_version,
+        )
+        .with_for_update()
+    )
+    return classification is not None
+
+
+def _load_active_global_taxonomy(session: Session) -> dict[str, UUID]:
+    categories = session.scalars(
+        select(Category).where(
+            Category.organization_id.is_(None),
+            Category.active.is_(True),
+        )
+    ).all()
+    return {category.slug: category.id for category in categories}
+
+
+def _accepted_category_id(
+    *,
+    suggestion: CategorySuggestionResult,
+    taxonomy: dict[str, UUID],
+) -> UUID | None:
+    if suggestion.confidence < CLASSIFICATION_CONFIDENCE_THRESHOLD:
+        return None
+    if suggestion.category_slug is None:
+        return None
+    return taxonomy.get(suggestion.category_slug)
 
 
 def _upsert_image_embedding(

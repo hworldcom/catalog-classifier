@@ -54,7 +54,9 @@ def test_upgrade_matches_models_and_supports_ordered_images(
         inspector = inspect(engine)
         assert set(inspector.get_table_names()) == {
             "alembic_version",
+            "categories",
             "image_assets",
+            "image_classifications",
             "image_embeddings",
             "organizations",
             "processing_jobs",
@@ -149,6 +151,50 @@ def test_upgrade_matches_models_and_supports_ordered_images(
         assert embedding_foreign_keys[
             "fk_image_embeddings_organization_id_organizations"
         ]["options"]["ondelete"] == "RESTRICT"
+        category_indexes = {
+            index["name"]: index for index in inspector.get_indexes("categories")
+        }
+        assert set(category_indexes) == {
+            "uq_categories_global_slug",
+            "uq_categories_organization_slug",
+        }
+        assert category_indexes["uq_categories_global_slug"]["unique"] is True
+        assert category_indexes["uq_categories_organization_slug"]["unique"] is True
+        category_foreign_keys = {
+            foreign_key["name"]: foreign_key
+            for foreign_key in inspector.get_foreign_keys("categories")
+        }
+        assert category_foreign_keys[
+            "fk_categories_organization_id_organizations"
+        ]["options"]["ondelete"] == "RESTRICT"
+        assert category_foreign_keys[
+            "fk_categories_parent_id_categories"
+        ]["options"]["ondelete"] == "RESTRICT"
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("image_classifications")
+        } == {
+            "ck_image_classifications_confidence_range",
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("image_classifications")
+        } == {
+            "uq_image_classifications_organization_image_pipeline_version",
+        }
+        classification_foreign_keys = {
+            foreign_key["name"]: foreign_key
+            for foreign_key in inspector.get_foreign_keys("image_classifications")
+        }
+        assert classification_foreign_keys[
+            "fk_image_classifications_category_id_categories"
+        ]["options"]["ondelete"] == "RESTRICT"
+        assert classification_foreign_keys[
+            "fk_image_classifications_image_organization_image_assets"
+        ]["options"]["ondelete"] == "CASCADE"
+        assert classification_foreign_keys[
+            "fk_image_classifications_organization_id_organizations"
+        ]["options"]["ondelete"] == "RESTRICT"
 
         with engine.begin() as connection:
             organization = connection.execute(
@@ -224,6 +270,26 @@ def test_upgrade_matches_models_and_supports_ordered_images(
             ).scalars()
             assert list(filenames) == ["front.jpg", "back.jpg"]
 
+            seeded_categories = connection.execute(
+                text(
+                    """
+                    SELECT child.slug, parent.slug AS parent_slug, child.active
+                    FROM categories child
+                    LEFT JOIN categories parent ON parent.id = child.parent_id
+                    WHERE child.organization_id IS NULL
+                    ORDER BY child.slug
+                    """
+                )
+            ).all()
+            assert set(seeded_categories) == {
+                ("clothing", None, True),
+                ("hoodies", "clothing", True),
+                ("jackets", "clothing", True),
+                ("sportswear", "clothing", True),
+                ("t-shirts", "clothing", True),
+                ("trousers", "clothing", True),
+            }
+
             image_id = connection.execute(
                 text(
                     """
@@ -277,6 +343,47 @@ def test_upgrade_matches_models_and_supports_ordered_images(
                 )
             ).scalar_one()
             assert list(persisted_embedding) == pytest.approx(sample_embedding)
+
+            image_classifications = Table(
+                "image_classifications",
+                MetaData(),
+                autoload_with=connection,
+            )
+            category_id = connection.execute(
+                text("SELECT id FROM categories WHERE slug = 't-shirts'")
+            ).scalar_one()
+            connection.execute(
+                image_classifications.insert().values(
+                    organization_id=DEFAULT_ORGANIZATION_ID,
+                    image_id=image_id,
+                    category_id=category_id,
+                    confidence=0.91,
+                    attributes_json={
+                        "categorySlug": "t-shirts",
+                        "confidence": 0.91,
+                    },
+                    provider="fake-provider",
+                    model="fake-model",
+                    raw_response_json={
+                        "categorySlug": "t-shirts",
+                        "confidence": 0.91,
+                    },
+                    pipeline_version="2026-06-01",
+                )
+            )
+            classification = connection.execute(
+                select(
+                    image_classifications.c.category_id,
+                    image_classifications.c.confidence,
+                    image_classifications.c.attributes_json,
+                ).where(image_classifications.c.image_id == image_id)
+            ).one()
+            assert classification.category_id == category_id
+            assert classification.confidence == pytest.approx(0.91)
+            assert classification.attributes_json == {
+                "categorySlug": "t-shirts",
+                "confidence": 0.91,
+            }
 
         with engine.connect() as connection:
             context = MigrationContext.configure(
@@ -503,6 +610,174 @@ def test_constraints_reject_duplicate_processing_idempotency_keys(
                         "batch_id": batch_id,
                         "image_id": image_id,
                     },
+                )
+    finally:
+        engine.dispose()
+
+
+def test_category_schema_constraints_and_unknown_classifications(
+    empty_database_url: str,
+) -> None:
+    engine = _upgrade(empty_database_url)
+
+    try:
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO categories (
+                            organization_id,
+                            slug,
+                            name_pl,
+                            name_en,
+                            name_de,
+                            name_vi
+                        )
+                        VALUES (
+                            NULL,
+                            'clothing',
+                            'Duplicate',
+                            'Duplicate',
+                            'Duplicate',
+                            'Duplicate'
+                        )
+                        """
+                    )
+                )
+
+        with engine.begin() as connection:
+            batch_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO upload_batches (organization_id)
+                    VALUES (:organization_id)
+                    RETURNING id
+                    """
+                ),
+                {"organization_id": DEFAULT_ORGANIZATION_ID},
+            ).scalar_one()
+            image_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO image_assets (
+                        organization_id,
+                        batch_id,
+                        original_object_key,
+                        original_filename,
+                        upload_order,
+                        mime_type,
+                        size_bytes,
+                        status
+                    )
+                    VALUES (
+                        :organization_id,
+                        :batch_id,
+                        'classifications/front.jpg',
+                        'front.jpg',
+                        0,
+                        'image/jpeg',
+                        100,
+                        'processed'
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "organization_id": DEFAULT_ORGANIZATION_ID,
+                    "batch_id": batch_id,
+                },
+            ).scalar_one()
+            image_classifications = Table(
+                "image_classifications",
+                MetaData(),
+                autoload_with=connection,
+            )
+            connection.execute(
+                image_classifications.insert().values(
+                    organization_id=DEFAULT_ORGANIZATION_ID,
+                    image_id=image_id,
+                    category_id=None,
+                    confidence=0.41,
+                    attributes_json={
+                        "categorySlug": "unknown",
+                        "confidence": 0.41,
+                    },
+                    provider="fake-provider",
+                    model="fake-model",
+                    raw_response_json={
+                        "categorySlug": "not-in-taxonomy",
+                        "confidence": 0.41,
+                    },
+                    pipeline_version="2026-06-01",
+                )
+            )
+            persisted_classification = connection.execute(
+                select(
+                    image_classifications.c.category_id,
+                    image_classifications.c.confidence,
+                    image_classifications.c.attributes_json,
+                ).where(image_classifications.c.image_id == image_id)
+            ).one()
+            assert persisted_classification.category_id is None
+            assert persisted_classification.confidence == pytest.approx(0.41)
+            assert persisted_classification.attributes_json == {
+                "categorySlug": "unknown",
+                "confidence": 0.41,
+            }
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                image_classifications = Table(
+                    "image_classifications",
+                    MetaData(),
+                    autoload_with=connection,
+                )
+                connection.execute(
+                    image_classifications.insert().values(
+                        organization_id=DEFAULT_ORGANIZATION_ID,
+                        image_id=image_id,
+                        category_id=None,
+                        confidence=0.52,
+                        attributes_json={
+                            "categorySlug": "unknown",
+                            "confidence": 0.52,
+                        },
+                        provider="fake-provider",
+                        model="fake-model",
+                        raw_response_json={
+                            "categorySlug": "unknown",
+                            "confidence": 0.52,
+                        },
+                        pipeline_version="2026-06-01",
+                    )
+                )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                image_classifications = Table(
+                    "image_classifications",
+                    MetaData(),
+                    autoload_with=connection,
+                )
+                connection.execute(
+                    image_classifications.insert().values(
+                        organization_id=DEFAULT_ORGANIZATION_ID,
+                        image_id=image_id,
+                        category_id=None,
+                        confidence=1.1,
+                        attributes_json={
+                            "categorySlug": "unknown",
+                            "confidence": 1.1,
+                        },
+                        provider="fake-provider",
+                        model="fake-model",
+                        raw_response_json={
+                            "categorySlug": "unknown",
+                            "confidence": 1.1,
+                        },
+                        pipeline_version="2026-06-02",
+                    )
                 )
     finally:
         engine.dispose()

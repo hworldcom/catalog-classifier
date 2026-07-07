@@ -12,6 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from catalog_api.category_suggestion_providers import (
+    CategorySuggestionProvider,
+    get_category_suggestion_provider,
+)
 from catalog_api.database import get_session
 from catalog_api.image_embedding_providers import (
     ImageEmbeddingProvider,
@@ -33,9 +37,13 @@ from catalog_api.local_batches import (
     LocalImageNotFoundError,
 )
 from catalog_api.processing_jobs import (
+    ClassifyImageTaskPayload,
     ProcessImageTaskPayload,
+    ProcessingQueue,
     ProcessingJobExecutionError,
     ProcessingJobNotFoundError,
+    classify_image_task,
+    get_processing_queue,
     process_image_task,
 )
 from catalog_api.processing_storage import WorkerStorage, get_worker_storage
@@ -109,6 +117,20 @@ class ProcessImageTaskRequest(ApiModel):
 
 
 class ProcessImageTaskResponse(ApiModel):
+    batch_id: UUID = Field(serialization_alias="batchId")
+    image_id: UUID = Field(serialization_alias="imageId")
+    pipeline_version: str = Field(serialization_alias="pipelineVersion")
+    job_status: str = Field(serialization_alias="jobStatus")
+    did_work: bool = Field(serialization_alias="didWork")
+
+
+class ClassifyImageTaskRequest(ApiModel):
+    batch_id: UUID = Field(alias="batchId")
+    image_id: UUID = Field(alias="imageId")
+    pipeline_version: StrictStr = Field(alias="pipelineVersion")
+
+
+class ClassifyImageTaskResponse(ApiModel):
     batch_id: UUID = Field(serialization_alias="batchId")
     image_id: UUID = Field(serialization_alias="imageId")
     pipeline_version: str = Field(serialization_alias="pipelineVersion")
@@ -592,6 +614,10 @@ def process_image_worker_task(
         ImageEmbeddingProvider,
         Depends(get_image_embedding_provider),
     ],
+    processing_queue: Annotated[
+        ProcessingQueue,
+        Depends(get_processing_queue),
+    ],
 ) -> ProcessImageTaskResponse:
     try:
         result = process_image_task(
@@ -603,6 +629,7 @@ def process_image_worker_task(
             ),
             storage=storage_client,
             embedding_provider=embedding_provider,
+            queue=processing_queue,
         )
     except ProcessingJobNotFoundError as error:
         raise _processing_job_not_found() from error
@@ -619,6 +646,54 @@ def process_image_worker_task(
         ) from error
 
     return ProcessImageTaskResponse(
+        batch_id=result.batch_id,
+        image_id=result.image_id,
+        pipeline_version=result.pipeline_version,
+        job_status=result.job_status,
+        did_work=result.did_work,
+    )
+
+
+@app.post(
+    "/internal/tasks/classify-image",
+    response_model=ClassifyImageTaskResponse,
+    status_code=status.HTTP_200_OK,
+)
+def classify_image_worker_task(
+    request: ClassifyImageTaskRequest,
+    session: Annotated[Session, Depends(get_session)],
+    storage_client: Annotated[WorkerStorage, Depends(get_worker_storage)],
+    category_provider: Annotated[
+        CategorySuggestionProvider,
+        Depends(get_category_suggestion_provider),
+    ],
+) -> ClassifyImageTaskResponse:
+    try:
+        result = classify_image_task(
+            session,
+            payload=ClassifyImageTaskPayload(
+                batch_id=request.batch_id,
+                image_id=request.image_id,
+                pipeline_version=request.pipeline_version,
+            ),
+            storage=storage_client,
+            category_provider=category_provider,
+        )
+    except ProcessingJobNotFoundError as error:
+        raise _processing_job_not_found() from error
+    except ProcessingJobExecutionError as error:
+        raise _processing_job_error(
+            code=error.error_code,
+            message=error.message,
+        ) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _processing_job_error(
+            code="database_error",
+            message="Unable to persist the image classification result.",
+        ) from error
+
+    return ClassifyImageTaskResponse(
         batch_id=result.batch_id,
         image_id=result.image_id,
         pipeline_version=result.pipeline_version,
