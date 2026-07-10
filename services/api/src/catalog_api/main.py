@@ -59,6 +59,12 @@ from catalog_api.processing_orchestration import (
     start_processing_batch,
 )
 from catalog_api.processing_storage import WorkerStorage, get_worker_storage
+from catalog_api.review_groups import (
+    ReviewBatchGroupsState,
+    ReviewBatchNotFoundError,
+    ReviewBatchStateError,
+    get_review_batch_groups,
+)
 from catalog_api.upload_batches import (
     InvalidUploadMetadataError,
     InvalidRetrySelectionError,
@@ -218,6 +224,59 @@ class ProcessingBatchResponse(ApiModel):
     processed_file_count: int = Field(serialization_alias="processedFileCount")
     pipeline_version: str = Field(serialization_alias="pipelineVersion")
     images: list[ProcessingBatchImageResponse]
+
+
+class ReviewGroupImageResponse(ApiModel):
+    image_id: UUID = Field(serialization_alias="imageId")
+    original_filename: str = Field(serialization_alias="originalFilename")
+    upload_order: int = Field(serialization_alias="uploadOrder")
+    thumbnail_url: str = Field(serialization_alias="thumbnailUrl")
+    position: int
+    is_duplicate: bool = Field(serialization_alias="isDuplicate")
+    duplicate_of_image_id: UUID | None = Field(
+        default=None,
+        serialization_alias="duplicateOfImageId",
+    )
+    membership_source: str = Field(serialization_alias="membershipSource")
+    membership_confidence: float | None = Field(
+        default=None,
+        serialization_alias="membershipConfidence",
+    )
+
+
+class ReviewGroupResponse(ApiModel):
+    group_id: UUID = Field(serialization_alias="groupId")
+    status: str
+    confidence: float | None = None
+    cover_image_id: UUID | None = Field(
+        default=None,
+        serialization_alias="coverImageId",
+    )
+    suggested_category_slug: str | None = Field(
+        default=None,
+        serialization_alias="suggestedCategorySlug",
+    )
+    approved_category_slug: str | None = Field(
+        default=None,
+        serialization_alias="approvedCategorySlug",
+    )
+    possible_existing_product_id: UUID | None = Field(
+        default=None,
+        serialization_alias="possibleExistingProductId",
+    )
+    warnings: list[str]
+    images: list[ReviewGroupImageResponse]
+
+
+class ReviewBatchGroupsResponse(ApiModel):
+    batch_id: UUID = Field(serialization_alias="batchId")
+    organization_id: UUID = Field(serialization_alias="organizationId")
+    status: str
+    pipeline_version: str | None = Field(
+        default=None,
+        serialization_alias="pipelineVersion",
+    )
+    groups: list[ReviewGroupResponse]
 
 
 class LocalBatchFileResult(ApiModel):
@@ -410,6 +469,16 @@ def _processing_batch_state_error() -> HTTPException:
     )
 
 
+def _review_batch_not_ready() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "batch_not_review_ready",
+            "message": "Upload batch has not entered the review phase.",
+        },
+    )
+
+
 def _processing_thumbnail_not_found() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
@@ -534,6 +603,44 @@ def _processing_batch_response(
                 has_embedding=image.has_embedding,
             )
             for image in snapshot.images
+        ],
+    )
+
+
+def _review_batch_groups_response(
+    snapshot: ReviewBatchGroupsState,
+) -> ReviewBatchGroupsResponse:
+    return ReviewBatchGroupsResponse(
+        batch_id=snapshot.batch_id,
+        organization_id=snapshot.organization_id,
+        status=snapshot.status,
+        pipeline_version=snapshot.pipeline_version,
+        groups=[
+            ReviewGroupResponse(
+                group_id=group.group_id,
+                status=group.status,
+                confidence=group.confidence,
+                cover_image_id=group.cover_image_id,
+                suggested_category_slug=group.suggested_category_slug,
+                approved_category_slug=group.approved_category_slug,
+                possible_existing_product_id=group.possible_existing_product_id,
+                warnings=group.warnings,
+                images=[
+                    ReviewGroupImageResponse(
+                        image_id=image.image_id,
+                        original_filename=image.original_filename,
+                        upload_order=image.upload_order,
+                        thumbnail_url=image.thumbnail_url,
+                        position=image.position,
+                        is_duplicate=image.is_duplicate,
+                        duplicate_of_image_id=image.duplicate_of_image_id,
+                        membership_source=image.membership_source,
+                        membership_confidence=image.membership_confidence,
+                    )
+                    for image in group.images
+                ],
+            )
+            for group in snapshot.groups
         ],
     )
 
@@ -789,6 +896,29 @@ def get_durable_upload_batch_thumbnail(
         media_type="image/jpeg",
         headers=NO_STORE_HEADERS,
     )
+
+
+@app.get(
+    "/v1/upload-batches/{batch_id}/groups",
+    response_model=ReviewBatchGroupsResponse,
+)
+def get_durable_upload_batch_groups(
+    batch_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = get_review_batch_groups(session, batch_id=batch_id)
+    except ReviewBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewBatchStateError as error:
+        raise _review_batch_not_ready() from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to load upload batch review groups."
+        ) from error
+
+    return _review_batch_groups_response(snapshot)
 
 
 @app.post(

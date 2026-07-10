@@ -59,7 +59,11 @@ def test_upgrade_matches_models_and_supports_ordered_images(
             "image_classifications",
             "image_embeddings",
             "organizations",
+            "pair_assessments",
             "processing_jobs",
+            "product_group_images",
+            "product_groups",
+            "review_events",
             "upload_batches",
         }
         assert {
@@ -89,6 +93,7 @@ def test_upgrade_matches_models_and_supports_ordered_images(
             for constraint in inspector.get_unique_constraints("image_assets")
         } == {
             "uq_image_assets_id_organization_id",
+            "uq_image_assets_id_organization_batch",
             "uq_image_assets_organization_batch_upload_order",
             "uq_image_assets_organization_original_object_key",
             "uq_image_assets_organization_thumbnail_object_key",
@@ -194,6 +199,111 @@ def test_upgrade_matches_models_and_supports_ordered_images(
         ]["options"]["ondelete"] == "CASCADE"
         assert classification_foreign_keys[
             "fk_image_classifications_organization_id_organizations"
+        ]["options"]["ondelete"] == "RESTRICT"
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("pair_assessments")
+        } == {
+            "ck_pair_assessments_canonical_image_order",
+            "ck_pair_assessments_confidence_range",
+            "ck_pair_assessments_decision",
+            "ck_pair_assessments_phash_distance_nonnegative",
+            "ck_pair_assessments_upload_order_distance_nonnegative",
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("pair_assessments")
+        } == {
+            "uq_pair_assessments_organization_batch_pair_pipeline",
+        }
+        pair_foreign_keys = {
+            foreign_key["name"]: foreign_key
+            for foreign_key in inspector.get_foreign_keys("pair_assessments")
+        }
+        assert pair_foreign_keys[
+            "fk_pair_assessments_batch_organization_upload_batches"
+        ]["options"]["ondelete"] == "CASCADE"
+        assert pair_foreign_keys[
+            "fk_pair_assessments_image_a_organization_batch_image_assets"
+        ]["options"]["ondelete"] == "CASCADE"
+        assert pair_foreign_keys[
+            "fk_pair_assessments_image_b_organization_batch_image_assets"
+        ]["options"]["ondelete"] == "CASCADE"
+        assert pair_foreign_keys[
+            "fk_pair_assessments_organization_id_organizations"
+        ]["options"]["ondelete"] == "RESTRICT"
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("product_groups")
+        } == {
+            "ck_product_groups_confidence_range",
+            "ck_product_groups_status",
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("product_groups")
+        } == {
+            "uq_product_groups_id_organization_batch",
+        }
+        group_foreign_keys = {
+            foreign_key["name"]: foreign_key
+            for foreign_key in inspector.get_foreign_keys("product_groups")
+        }
+        assert group_foreign_keys[
+            "fk_product_groups_approved_category_id_categories"
+        ]["options"]["ondelete"] == "RESTRICT"
+        assert group_foreign_keys[
+            "fk_product_groups_batch_organization_upload_batches"
+        ]["options"]["ondelete"] == "CASCADE"
+        assert group_foreign_keys[
+            "fk_product_groups_cover_image_organization_batch_image_assets"
+        ]["options"]["ondelete"] == "RESTRICT"
+        assert group_foreign_keys[
+            "fk_product_groups_organization_id_organizations"
+        ]["options"]["ondelete"] == "RESTRICT"
+        assert group_foreign_keys[
+            "fk_product_groups_suggested_category_id_categories"
+        ]["options"]["ondelete"] == "RESTRICT"
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("product_group_images")
+        } == {
+            "ck_product_group_images_duplicate_not_self",
+            "ck_product_group_images_membership_confidence_range",
+            "ck_product_group_images_position_nonnegative",
+        }
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("product_group_images")
+        } == {
+            "uq_product_group_images_group_position",
+            "uq_product_group_images_organization_batch_image",
+        }
+        membership_foreign_keys = {
+            foreign_key["name"]: foreign_key
+            for foreign_key in inspector.get_foreign_keys("product_group_images")
+        }
+        assert membership_foreign_keys[
+            "fk_product_group_images_duplicate_image_assets"
+        ]["options"]["ondelete"] == "RESTRICT"
+        assert membership_foreign_keys[
+            "fk_product_group_images_group_organization_batch_product_groups"
+        ]["options"]["ondelete"] == "CASCADE"
+        assert membership_foreign_keys[
+            "fk_product_group_images_image_organization_batch_image_assets"
+        ]["options"]["ondelete"] == "CASCADE"
+        assert membership_foreign_keys[
+            "fk_product_group_images_organization_id_organizations"
+        ]["options"]["ondelete"] == "RESTRICT"
+        review_foreign_keys = {
+            foreign_key["name"]: foreign_key
+            for foreign_key in inspector.get_foreign_keys("review_events")
+        }
+        assert review_foreign_keys[
+            "fk_review_events_batch_organization_upload_batches"
+        ]["options"]["ondelete"] == "CASCADE"
+        assert review_foreign_keys[
+            "fk_review_events_organization_id_organizations"
         ]["options"]["ondelete"] == "RESTRICT"
 
         with engine.begin() as connection:
@@ -778,6 +888,380 @@ def test_category_schema_constraints_and_unknown_classifications(
                         },
                         pipeline_version="2026-06-02",
                     )
+                )
+    finally:
+        engine.dispose()
+
+
+def test_grouping_schema_constraints_and_review_tables(
+    empty_database_url: str,
+) -> None:
+    engine = _upgrade(empty_database_url)
+
+    try:
+        with engine.begin() as connection:
+            batch_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO upload_batches (
+                        organization_id,
+                        status,
+                        pipeline_version
+                    )
+                    VALUES (:organization_id, 'review_required', '2026-06-01')
+                    RETURNING id
+                    """
+                ),
+                {"organization_id": DEFAULT_ORGANIZATION_ID},
+            ).scalar_one()
+            image_ids = []
+            for upload_order, filename in ((0, "front.jpg"), (1, "back.jpg")):
+                image_ids.append(
+                    connection.execute(
+                        text(
+                            """
+                            INSERT INTO image_assets (
+                                organization_id,
+                                batch_id,
+                                original_object_key,
+                                thumbnail_object_key,
+                                original_filename,
+                                upload_order,
+                                mime_type,
+                                size_bytes,
+                                status
+                            )
+                            VALUES (
+                                :organization_id,
+                                :batch_id,
+                                :object_key,
+                                :thumbnail_key,
+                                :filename,
+                                :upload_order,
+                                'image/jpeg',
+                                100,
+                                'processed'
+                            )
+                            RETURNING id
+                            """
+                        ),
+                        {
+                            "organization_id": DEFAULT_ORGANIZATION_ID,
+                            "batch_id": batch_id,
+                            "object_key": f"grouping/{filename}",
+                            "thumbnail_key": f"grouping/thumbs/{filename}",
+                            "filename": filename,
+                            "upload_order": upload_order,
+                        },
+                    ).scalar_one()
+                )
+
+            image_a_id, image_b_id = sorted(image_ids)
+            category_id = connection.execute(
+                text("SELECT id FROM categories WHERE slug = 'sportswear'")
+            ).scalar_one()
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO pair_assessments (
+                        organization_id,
+                        batch_id,
+                        image_a_id,
+                        image_b_id,
+                        embedding_similarity,
+                        phash_distance,
+                        category_match,
+                        upload_order_distance,
+                        decision,
+                        confidence,
+                        decision_source,
+                        pipeline_version
+                    )
+                    VALUES (
+                        :organization_id,
+                        :batch_id,
+                        :image_a_id,
+                        :image_b_id,
+                        0.97,
+                        3,
+                        true,
+                        1,
+                        'same_product',
+                        0.93,
+                        'qa',
+                        '2026-06-01'
+                    )
+                    """
+                ),
+                {
+                    "organization_id": DEFAULT_ORGANIZATION_ID,
+                    "batch_id": batch_id,
+                    "image_a_id": image_a_id,
+                    "image_b_id": image_b_id,
+                },
+            )
+            group_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO product_groups (
+                        organization_id,
+                        batch_id,
+                        status,
+                        suggested_category_id,
+                        cover_image_id,
+                        confidence
+                    )
+                    VALUES (
+                        :organization_id,
+                        :batch_id,
+                        'proposed',
+                        :category_id,
+                        :cover_image_id,
+                        0.93
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "organization_id": DEFAULT_ORGANIZATION_ID,
+                    "batch_id": batch_id,
+                    "category_id": category_id,
+                    "cover_image_id": image_ids[0],
+                },
+            ).scalar_one()
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO product_group_images (
+                        organization_id,
+                        batch_id,
+                        group_id,
+                        image_id,
+                        position,
+                        membership_source,
+                        membership_confidence
+                    )
+                    VALUES (
+                        :organization_id,
+                        :batch_id,
+                        :group_id,
+                        :image_id,
+                        0,
+                        'engine',
+                        0.94
+                    )
+                    """
+                ),
+                {
+                    "organization_id": DEFAULT_ORGANIZATION_ID,
+                    "batch_id": batch_id,
+                    "group_id": group_id,
+                    "image_id": image_ids[0],
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO product_group_images (
+                        organization_id,
+                        batch_id,
+                        group_id,
+                        image_id,
+                        position,
+                        membership_source,
+                        membership_confidence,
+                        is_duplicate,
+                        duplicate_of_image_id
+                    )
+                    VALUES (
+                        :organization_id,
+                        :batch_id,
+                        :group_id,
+                        :image_id,
+                        1,
+                        'engine',
+                        0.94,
+                        true,
+                        :duplicate_of_image_id
+                    )
+                    """
+                ),
+                {
+                    "organization_id": DEFAULT_ORGANIZATION_ID,
+                    "batch_id": batch_id,
+                    "group_id": group_id,
+                    "image_id": image_ids[1],
+                    "duplicate_of_image_id": image_ids[0],
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO review_events (
+                        organization_id,
+                        batch_id,
+                        group_id,
+                        action_type,
+                        payload_json
+                    )
+                    VALUES (
+                        :organization_id,
+                        :batch_id,
+                        :group_id,
+                        'qa_seed',
+                        '{}'::jsonb
+                    )
+                    """
+                ),
+                {
+                    "organization_id": DEFAULT_ORGANIZATION_ID,
+                    "batch_id": batch_id,
+                    "group_id": group_id,
+                },
+            )
+
+            assert connection.execute(
+                text("SELECT count(*) FROM product_group_images")
+            ).scalar_one() == 2
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO pair_assessments (
+                            organization_id,
+                            batch_id,
+                            image_a_id,
+                            image_b_id,
+                            decision,
+                            decision_source,
+                            pipeline_version
+                        )
+                        VALUES (
+                            :organization_id,
+                            :batch_id,
+                            :image_b_id,
+                            :image_a_id,
+                            'same_product',
+                            'qa',
+                            '2026-06-02'
+                        )
+                        """
+                    ),
+                    {
+                        "organization_id": DEFAULT_ORGANIZATION_ID,
+                        "batch_id": batch_id,
+                        "image_a_id": image_a_id,
+                        "image_b_id": image_b_id,
+                    },
+                )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO pair_assessments (
+                            organization_id,
+                            batch_id,
+                            image_a_id,
+                            image_b_id,
+                            decision,
+                            decision_source,
+                            pipeline_version
+                        )
+                        VALUES (
+                            :organization_id,
+                            :batch_id,
+                            :image_a_id,
+                            :image_b_id,
+                            'maybe',
+                            'qa',
+                            '2026-06-02'
+                        )
+                        """
+                    ),
+                    {
+                        "organization_id": DEFAULT_ORGANIZATION_ID,
+                        "batch_id": batch_id,
+                        "image_a_id": image_a_id,
+                        "image_b_id": image_b_id,
+                    },
+                )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO product_groups (
+                            organization_id,
+                            batch_id,
+                            status
+                        )
+                        VALUES (:organization_id, :batch_id, 'pending')
+                        """
+                    ),
+                    {
+                        "organization_id": DEFAULT_ORGANIZATION_ID,
+                        "batch_id": batch_id,
+                    },
+                )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                second_group_id = connection.execute(
+                    text(
+                        """
+                        INSERT INTO product_groups (
+                            organization_id,
+                            batch_id,
+                            status,
+                            cover_image_id
+                        )
+                        VALUES (
+                            :organization_id,
+                            :batch_id,
+                            'proposed',
+                            :cover_image_id
+                        )
+                        RETURNING id
+                        """
+                    ),
+                    {
+                        "organization_id": DEFAULT_ORGANIZATION_ID,
+                        "batch_id": batch_id,
+                        "cover_image_id": image_ids[1],
+                    },
+                ).scalar_one()
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO product_group_images (
+                            organization_id,
+                            batch_id,
+                            group_id,
+                            image_id,
+                            position,
+                            membership_source
+                        )
+                        VALUES (
+                            :organization_id,
+                            :batch_id,
+                            :group_id,
+                            :image_id,
+                            0,
+                            'engine'
+                        )
+                        """
+                    ),
+                    {
+                        "organization_id": DEFAULT_ORGANIZATION_ID,
+                        "batch_id": batch_id,
+                        "group_id": second_group_id,
+                        "image_id": image_ids[0],
+                    },
                 )
     finally:
         engine.dispose()

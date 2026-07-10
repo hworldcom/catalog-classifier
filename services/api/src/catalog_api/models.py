@@ -52,6 +52,16 @@ PROCESSING_JOB_STATUSES = (
     "completed",
     "failed",
 )
+PRODUCT_GROUP_STATUSES = (
+    "proposed",
+    "approved",
+    "rejected",
+)
+PAIR_ASSESSMENT_DECISIONS = (
+    "same_product",
+    "different_product",
+    "uncertain",
+)
 
 
 def _status_check(column_name: str, values: tuple[str, ...]) -> str:
@@ -180,6 +190,12 @@ class ImageAsset(Base):
             "id",
             "organization_id",
             name="uq_image_assets_id_organization_id",
+        ),
+        UniqueConstraint(
+            "id",
+            "organization_id",
+            "batch_id",
+            name="uq_image_assets_id_organization_batch",
         ),
         CheckConstraint(
             _status_check("status", IMAGE_STATUSES),
@@ -483,6 +499,300 @@ class ImageClassification(Base):
     model: Mapped[str] = mapped_column(String(100), nullable=False)
     raw_response_json: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     pipeline_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class PairAssessment(Base):
+    __tablename__ = "pair_assessments"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("batch_id", "organization_id"),
+            ("upload_batches.id", "upload_batches.organization_id"),
+            name="fk_pair_assessments_batch_organization_upload_batches",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("image_a_id", "organization_id", "batch_id"),
+            ("image_assets.id", "image_assets.organization_id", "image_assets.batch_id"),
+            name="fk_pair_assessments_image_a_organization_batch_image_assets",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("image_b_id", "organization_id", "batch_id"),
+            ("image_assets.id", "image_assets.organization_id", "image_assets.batch_id"),
+            name="fk_pair_assessments_image_b_organization_batch_image_assets",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "batch_id",
+            "image_a_id",
+            "image_b_id",
+            "pipeline_version",
+            name="uq_pair_assessments_organization_batch_pair_pipeline",
+        ),
+        CheckConstraint(
+            _status_check("decision", PAIR_ASSESSMENT_DECISIONS),
+            name="decision",
+        ),
+        CheckConstraint(
+            "image_a_id < image_b_id",
+            name="canonical_image_order",
+        ),
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
+            name="confidence_range",
+        ),
+        CheckConstraint(
+            "phash_distance IS NULL OR phash_distance >= 0",
+            name="phash_distance_nonnegative",
+        ),
+        CheckConstraint(
+            "upload_order_distance IS NULL OR upload_order_distance >= 0",
+            name="upload_order_distance_nonnegative",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    batch_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=False,
+    )
+    image_a_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=False,
+    )
+    image_b_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=False,
+    )
+    embedding_similarity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    phash_distance: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    category_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    upload_order_distance: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    decision_source: Mapped[str] = mapped_column(String(100), nullable=False)
+    pipeline_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class ProductGroup(Base):
+    __tablename__ = "product_groups"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("batch_id", "organization_id"),
+            ("upload_batches.id", "upload_batches.organization_id"),
+            name="fk_product_groups_batch_organization_upload_batches",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("cover_image_id", "organization_id", "batch_id"),
+            ("image_assets.id", "image_assets.organization_id", "image_assets.batch_id"),
+            name="fk_product_groups_cover_image_organization_batch_image_assets",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id",
+            "organization_id",
+            "batch_id",
+            name="uq_product_groups_id_organization_batch",
+        ),
+        CheckConstraint(
+            _status_check("status", PRODUCT_GROUP_STATUSES),
+            name="status",
+        ),
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
+            name="confidence_range",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    batch_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default=text("'proposed'"),
+    )
+    suggested_category_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("categories.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    approved_category_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("categories.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    cover_image_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=True,
+    )
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    possible_existing_product_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+
+class ProductGroupImage(Base):
+    __tablename__ = "product_group_images"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("duplicate_of_image_id", "organization_id", "batch_id"),
+            ("image_assets.id", "image_assets.organization_id", "image_assets.batch_id"),
+            name="fk_product_group_images_duplicate_image_assets",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ("group_id", "organization_id", "batch_id"),
+            ("product_groups.id", "product_groups.organization_id", "product_groups.batch_id"),
+            name="fk_product_group_images_group_organization_batch_product_groups",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ("image_id", "organization_id", "batch_id"),
+            ("image_assets.id", "image_assets.organization_id", "image_assets.batch_id"),
+            name="fk_product_group_images_image_organization_batch_image_assets",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "group_id",
+            "position",
+            name="uq_product_group_images_group_position",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "batch_id",
+            "image_id",
+            name="uq_product_group_images_organization_batch_image",
+        ),
+        CheckConstraint(
+            "position >= 0",
+            name="position_nonnegative",
+        ),
+        CheckConstraint(
+            "membership_confidence IS NULL OR "
+            "(membership_confidence >= 0 AND membership_confidence <= 1)",
+            name="membership_confidence_range",
+        ),
+        CheckConstraint(
+            "duplicate_of_image_id IS NULL OR duplicate_of_image_id <> image_id",
+            name="duplicate_not_self",
+        ),
+    )
+
+    organization_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    batch_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=False,
+    )
+    group_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+        nullable=False,
+    )
+    image_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+        nullable=False,
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    membership_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    membership_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    is_duplicate: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+    )
+    duplicate_of_image_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=True,
+    )
+
+
+class ReviewEvent(Base):
+    __tablename__ = "review_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("batch_id", "organization_id"),
+            ("upload_batches.id", "upload_batches.organization_id"),
+            name="fk_review_events_batch_organization_upload_batches",
+            ondelete="CASCADE",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    organization_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    batch_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=False,
+    )
+    group_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=True,
+    )
+    image_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=True,
+    )
+    user_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        nullable=True,
+    )
+    action_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload_json: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
