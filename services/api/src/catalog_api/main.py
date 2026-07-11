@@ -66,6 +66,13 @@ from catalog_api.processing_orchestration import (
     start_processing_batch,
 )
 from catalog_api.processing_storage import WorkerStorage, get_worker_storage
+from catalog_api.review_approvals import (
+    ReviewApprovalBatchNotFoundError,
+    ReviewApprovalResourceNotFoundError,
+    ReviewApprovalStateError,
+    approve_review_batch,
+    approve_review_group,
+)
 from catalog_api.review_groups import (
     ReviewBatchGroupsState,
     ReviewBatchNotFoundError,
@@ -564,6 +571,16 @@ def _review_edit_state_error(message: str) -> HTTPException:
         status_code=status.HTTP_409_CONFLICT,
         detail={
             "code": "review_edit_not_allowed",
+            "message": message,
+        },
+    )
+
+
+def _review_approval_state_error(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "review_approval_not_allowed",
             "message": message,
         },
     )
@@ -1237,6 +1254,54 @@ def update_durable_review_group_image(
         raise _upload_batch_database_error(
             "Unable to update review group image."
         ) from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.post(
+    "/v1/groups/{group_id}/approve",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def approve_durable_review_group(
+    group_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = approve_review_group(session, group_id=group_id)
+    except ReviewApprovalBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewApprovalResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewApprovalStateError as error:
+        raise _review_approval_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error("Unable to approve review group.") from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.post(
+    "/v1/upload-batches/{batch_id}/approve",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def approve_durable_review_batch(
+    batch_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = approve_review_batch(session, batch_id=batch_id)
+    except ReviewApprovalBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewApprovalResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewApprovalStateError as error:
+        raise _review_approval_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error("Unable to approve review batch.") from error
 
     return _review_batch_groups_response(snapshot)
 

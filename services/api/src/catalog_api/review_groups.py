@@ -15,6 +15,8 @@ from catalog_api.models import (
 )
 from catalog_api.upload_batches import DEFAULT_ORGANIZATION_ID
 
+REVIEW_BATCH_STATUSES = {"review_required", "approved"}
+
 
 class ReviewBatchNotFoundError(Exception):
     """Raised when a batch cannot be found for review."""
@@ -72,7 +74,7 @@ def get_review_batch_groups(
     )
     if batch is None:
         raise ReviewBatchNotFoundError
-    if batch.status != "review_required":
+    if batch.status not in REVIEW_BATCH_STATUSES:
         raise ReviewBatchStateError("Batch is not ready for review.")
 
     groups = session.scalars(
