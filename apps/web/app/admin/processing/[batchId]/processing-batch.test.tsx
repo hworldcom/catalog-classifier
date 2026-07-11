@@ -83,7 +83,28 @@ describe("ProcessingBatch", () => {
     ).toBeEnabled();
     expect(screen.getByText("front.jpg")).toBeInTheDocument();
     expect(screen.getAllByText("not created")).toHaveLength(2);
-    const thumbnail = screen.getByRole("img", {
+    expect(screen.getByText("Thumbnail pending")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("img", { name: "Thumbnail for front.jpg" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders thumbnails after image processing completes", async () => {
+    loadProcessingBatchMock.mockResolvedValue(
+      processingSnapshot({
+        status: "processing",
+        imageStatus: "processed",
+        processJobStatus: "completed",
+        classifyJobStatus: "completed",
+        hasHashes: true,
+        hasEmbedding: true,
+        processedFileCount: 1,
+      }),
+    );
+
+    render(<ProcessingBatch batchId="batch-1" pollIntervalMs={1} />);
+
+    const thumbnail = await screen.findByRole("img", {
       name: "Thumbnail for front.jpg",
     });
     expect(thumbnail).toHaveAttribute(
@@ -124,9 +145,6 @@ describe("ProcessingBatch", () => {
     expect(startUploadBatchProcessingMock).toHaveBeenCalledOnce();
     expect(startUploadBatchProcessingMock).toHaveBeenCalledWith("batch-1");
     expect(await screen.findByText("pending")).toBeInTheDocument();
-    fireEvent.error(
-      screen.getByRole("img", { name: "Thumbnail for front.jpg" }),
-    );
     expect(screen.getByText("Thumbnail pending")).toBeInTheDocument();
 
     await waitFor(() => {

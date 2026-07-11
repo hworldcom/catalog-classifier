@@ -19,6 +19,7 @@ from catalog_api.image_embedding_providers import (
     ImageEmbeddingProvider,
     get_image_embedding_provider,
 )
+from catalog_api.grouping import group_batch_task
 from catalog_api.models import (
     Category,
     ImageAsset,
@@ -29,8 +30,10 @@ from catalog_api.models import (
 )
 from catalog_api.processing_jobs import (
     CLASSIFY_IMAGE_JOB_TYPE,
+    GROUP_BATCH_JOB_TYPE,
     PROCESS_IMAGE_JOB_TYPE,
     ClassifyImageTaskPayload,
+    GroupBatchTaskPayload,
     InMemoryProcessingQueue,
     ProcessImageTaskPayload,
     ProcessingBatchNotFoundError,
@@ -40,6 +43,8 @@ from catalog_api.processing_jobs import (
     classify_image_task,
     claim_batch_for_processing,
     ensure_classify_jobs_for_processed_images,
+    ensure_group_batch_job_for_terminal_process_jobs,
+    group_batch_idempotency_key,
     process_image_task,
 )
 from catalog_api.processing_storage import WorkerStorage, get_worker_storage
@@ -322,6 +327,29 @@ def run_processing_batch(
                 continue
 
     with session_factory() as session:
+        ensured_group_payload = ensure_group_batch_job_for_terminal_process_jobs(
+            session,
+            batch_id=batch_id,
+            pipeline_version=pipeline_version,
+        )
+
+    queued_group_payloads = list(processing_queue.group_batch_tasks)
+    if ensured_group_payload is not None:
+        queued_group_payloads.append(ensured_group_payload)
+    group_payloads = _merged_group_payloads(
+        queued_payloads=queued_group_payloads,
+        session_factory=session_factory,
+        batch_id=batch_id,
+        pipeline_version=pipeline_version,
+    )
+    for payload in group_payloads:
+        with session_factory() as session:
+            try:
+                group_batch_task(session, payload=payload)
+            except Exception:
+                logger.exception("Local grouping task failed.")
+
+    with session_factory() as session:
         ensure_classify_jobs_for_processed_images(
             session,
             batch_id=batch_id,
@@ -413,6 +441,56 @@ def _load_classify_payloads(
             )
             for job in jobs
             if job.image_id is not None
+        ]
+
+
+def _merged_group_payloads(
+    *,
+    queued_payloads: list[GroupBatchTaskPayload],
+    session_factory: sessionmaker[Session],
+    batch_id: UUID,
+    pipeline_version: str,
+) -> list[GroupBatchTaskPayload]:
+    payloads_by_key = {
+        (payload.batch_id, payload.pipeline_version): payload
+        for payload in queued_payloads
+    }
+    for payload in _load_group_payloads(
+        session_factory=session_factory,
+        batch_id=batch_id,
+        pipeline_version=pipeline_version,
+    ):
+        payloads_by_key.setdefault((payload.batch_id, payload.pipeline_version), payload)
+    return list(payloads_by_key.values())
+
+
+def _load_group_payloads(
+    *,
+    session_factory: sessionmaker[Session],
+    batch_id: UUID,
+    pipeline_version: str,
+) -> list[GroupBatchTaskPayload]:
+    with session_factory() as session:
+        jobs = session.scalars(
+            select(ProcessingJob).where(
+                ProcessingJob.batch_id == batch_id,
+                ProcessingJob.organization_id == DEFAULT_ORGANIZATION_ID,
+                ProcessingJob.job_type == GROUP_BATCH_JOB_TYPE,
+                ProcessingJob.pipeline_version == pipeline_version,
+                ProcessingJob.idempotency_key
+                == group_batch_idempotency_key(
+                    batch_id=batch_id,
+                    pipeline_version=pipeline_version,
+                ),
+                ProcessingJob.status.in_(("pending", "failed", "started")),
+            )
+        ).all()
+        return [
+            GroupBatchTaskPayload(
+                batch_id=job.batch_id,
+                pipeline_version=job.pipeline_version,
+            )
+            for job in jobs
         ]
 
 

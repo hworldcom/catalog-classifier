@@ -22,6 +22,7 @@ from catalog_api.models import (
     ImageClassification,
     ImageEmbedding,
     ProcessingJob,
+    ProductGroup,
     UploadBatch,
 )
 from catalog_api.processing_orchestration import (
@@ -428,7 +429,7 @@ async def test_start_processing_returns_promptly_after_claiming_jobs(
     assert all(job.status == "pending" for job in jobs)
 
 
-async def test_start_processing_runs_local_pipeline_and_is_idempotent(
+async def test_start_processing_runs_local_pipeline_and_creates_review_groups(
     database_client: AsyncClient,
     migrated_engine: Engine,
     fake_worker_storage: FakeWorkerStorage,
@@ -457,14 +458,10 @@ async def test_start_processing_runs_local_pipeline_and_is_idempotent(
         response = await database_client.post(
             f"/v1/upload-batches/{batch_id}/start-processing"
         )
-        redelivery_response = await database_client.post(
-            f"/v1/upload-batches/{batch_id}/start-processing"
-        )
 
     assert response.status_code == 200
-    assert redelivery_response.status_code == 200
-    body = redelivery_response.json()
-    assert body["status"] == "processing"
+    body = response.json()
+    assert body["status"] == "review_required"
     assert body["processedFileCount"] == 2
     assert [
         (
@@ -498,10 +495,16 @@ async def test_start_processing_runs_local_pipeline_and_is_idempotent(
             .select_from(ImageClassification)
             .where(ImageClassification.image_id.in_(image_ids))
         )
+        group_count = session.scalar(
+            select(func.count()).select_from(ProductGroup).where(
+                ProductGroup.batch_id == batch_id
+            )
+        )
 
-    assert job_count == 4
+    assert job_count == 5
     assert embedding_count == 2
     assert classification_count == 2
+    assert group_count == 1
 
 
 async def test_start_processing_creates_missing_classify_jobs_for_processed_images(
@@ -530,13 +533,10 @@ async def test_start_processing_creates_missing_classify_jobs_for_processed_imag
         response = await database_client.post(
             f"/v1/upload-batches/{batch_id}/start-processing"
         )
-        redelivery_response = await database_client.post(
-            f"/v1/upload-batches/{batch_id}/start-processing"
-        )
 
     assert response.status_code == 200
-    assert redelivery_response.status_code == 200
-    body = redelivery_response.json()
+    body = response.json()
+    assert body["status"] == "review_required"
     [image] = body["images"]
     assert image["imageId"] == str(image_id)
     assert image["imageStatus"] == "processed"
@@ -559,9 +559,15 @@ async def test_start_processing_creates_missing_classify_jobs_for_processed_imag
             .select_from(ImageClassification)
             .where(ImageClassification.image_id == image_id)
         )
+        group_count = session.scalar(
+            select(func.count()).select_from(ProductGroup).where(
+                ProductGroup.batch_id == batch_id
+            )
+        )
 
     assert classify_job_count == 1
     assert classification_count == 1
+    assert group_count == 1
 
 
 async def test_start_processing_surfaces_retryable_provider_failure(

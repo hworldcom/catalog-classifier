@@ -47,8 +47,10 @@ from catalog_api.upload_batches import DEFAULT_ORGANIZATION_ID
 
 PROCESS_IMAGE_JOB_TYPE = "process-image"
 CLASSIFY_IMAGE_JOB_TYPE = "classify-image"
+GROUP_BATCH_JOB_TYPE = "group-batch"
 CLASSIFICATION_CONFIDENCE_THRESHOLD = 0.80
 TERMINAL_IMAGE_STATUSES = {"processed", "failed"}
+TERMINAL_PROCESSING_JOB_STATUSES = {"completed", "failed"}
 
 
 class ProcessingBatchNotFoundError(Exception):
@@ -84,6 +86,12 @@ class ClassifyImageTaskPayload:
     pipeline_version: str
 
 
+@dataclass(frozen=True)
+class GroupBatchTaskPayload:
+    batch_id: UUID
+    pipeline_version: str
+
+
 class ProcessingQueue(Protocol):
     def enqueue_process_image(self, payload: ProcessImageTaskPayload) -> None:
         """Enqueue a process-image task."""
@@ -91,17 +99,24 @@ class ProcessingQueue(Protocol):
     def enqueue_classify_image(self, payload: ClassifyImageTaskPayload) -> None:
         """Enqueue a classify-image task."""
 
+    def enqueue_group_batch(self, payload: GroupBatchTaskPayload) -> None:
+        """Enqueue a group-batch task."""
+
 
 class InMemoryProcessingQueue:
     def __init__(self) -> None:
         self.process_image_tasks: list[ProcessImageTaskPayload] = []
         self.classify_image_tasks: list[ClassifyImageTaskPayload] = []
+        self.group_batch_tasks: list[GroupBatchTaskPayload] = []
 
     def enqueue_process_image(self, payload: ProcessImageTaskPayload) -> None:
         self.process_image_tasks.append(payload)
 
     def enqueue_classify_image(self, payload: ClassifyImageTaskPayload) -> None:
         self.classify_image_tasks.append(payload)
+
+    def enqueue_group_batch(self, payload: GroupBatchTaskPayload) -> None:
+        self.group_batch_tasks.append(payload)
 
 
 @lru_cache
@@ -157,6 +172,14 @@ def classify_image_idempotency_key(
     pipeline_version: str,
 ) -> str:
     return f"{CLASSIFY_IMAGE_JOB_TYPE}:{image_id}:{pipeline_version}"
+
+
+def group_batch_idempotency_key(
+    *,
+    batch_id: UUID,
+    pipeline_version: str,
+) -> str:
+    return f"{GROUP_BATCH_JOB_TYPE}:{batch_id}:{pipeline_version}"
 
 
 def claim_batch_for_processing(
@@ -383,7 +406,12 @@ def process_image_task(
         image=image,
         pipeline_version=payload.pipeline_version,
     ):
-        session.commit()
+        _commit_and_enqueue_group_task_if_ready(
+            session,
+            batch=batch,
+            pipeline_version=payload.pipeline_version,
+            queue=queue,
+        )
         return ProcessImageTaskResult(
             batch_id=payload.batch_id,
             image_id=payload.image_id,
@@ -393,7 +421,12 @@ def process_image_task(
         )
 
     if job.status == "failed" and image.status == "failed":
-        session.commit()
+        _commit_and_enqueue_group_task_if_ready(
+            session,
+            batch=batch,
+            pipeline_version=payload.pipeline_version,
+            queue=queue,
+        )
         return ProcessImageTaskResult(
             batch_id=payload.batch_id,
             image_id=payload.image_id,
@@ -410,7 +443,12 @@ def process_image_task(
         job.status = "completed"
         job.completed_at = datetime.now(UTC)
         job.error_message = None
-        session.commit()
+        _commit_and_enqueue_group_task_if_ready(
+            session,
+            batch=batch,
+            pipeline_version=payload.pipeline_version,
+            queue=queue,
+        )
         return ProcessImageTaskResult(
             batch_id=payload.batch_id,
             image_id=payload.image_id,
@@ -448,7 +486,12 @@ def process_image_task(
             error_code="source_object_missing",
             error_message="The source object was not found in worker storage.",
         )
-        session.commit()
+        _commit_and_enqueue_group_task_if_ready(
+            session,
+            batch=batch,
+            pipeline_version=payload.pipeline_version,
+            queue=queue,
+        )
         return ProcessImageTaskResult(
             batch_id=payload.batch_id,
             image_id=payload.image_id,
@@ -463,7 +506,12 @@ def process_image_task(
             error_code="source_object_read_failed",
             error_message="The source object could not be read.",
         )
-        session.commit()
+        _commit_and_enqueue_group_task_if_ready(
+            session,
+            batch=batch,
+            pipeline_version=payload.pipeline_version,
+            queue=queue,
+        )
         raise ProcessingJobExecutionError(
             error_code="source_object_read_failed",
             message="The source object could not be read.",
@@ -480,7 +528,12 @@ def process_image_task(
             error_code=error.error_code,
             error_message=error.message,
         )
-        session.commit()
+        _commit_and_enqueue_group_task_if_ready(
+            session,
+            batch=batch,
+            pipeline_version=payload.pipeline_version,
+            queue=queue,
+        )
         return ProcessImageTaskResult(
             batch_id=payload.batch_id,
             image_id=payload.image_id,
@@ -498,7 +551,12 @@ def process_image_task(
             error_code="image_hash_generation_failed",
             error_message="The normalized image could not be perceptually hashed.",
         )
-        session.commit()
+        _commit_and_enqueue_group_task_if_ready(
+            session,
+            batch=batch,
+            pipeline_version=payload.pipeline_version,
+            queue=queue,
+        )
         raise ProcessingJobExecutionError(
             error_code="image_hash_generation_failed",
             message="The normalized image could not be perceptually hashed.",
@@ -517,7 +575,12 @@ def process_image_task(
             error_code="embedding_generation_failed",
             error_message="The image embedding could not be generated.",
         )
-        session.commit()
+        _commit_and_enqueue_group_task_if_ready(
+            session,
+            batch=batch,
+            pipeline_version=payload.pipeline_version,
+            queue=queue,
+        )
         raise ProcessingJobExecutionError(
             error_code="embedding_generation_failed",
             message="The image embedding could not be generated.",
@@ -552,7 +615,12 @@ def process_image_task(
             error_code="derived_object_write_failed",
             error_message="A derived object could not be written.",
         )
-        session.commit()
+        _commit_and_enqueue_group_task_if_ready(
+            session,
+            batch=batch,
+            pipeline_version=payload.pipeline_version,
+            queue=queue,
+        )
         raise ProcessingJobExecutionError(
             error_code="derived_object_write_failed",
             message="A derived object could not be written.",
@@ -586,9 +654,16 @@ def process_image_task(
     job.completed_at = datetime.now(UTC)
     job.error_message = None
     _increment_processed_count_once(batch=batch, was_terminal=was_terminal)
+    group_task = _ensure_group_batch_job_if_process_jobs_terminal(
+        session,
+        batch=batch,
+        pipeline_version=payload.pipeline_version,
+    )
     session.commit()
     if classify_task is not None:
         queue.enqueue_classify_image(classify_task)
+    if group_task is not None:
+        queue.enqueue_group_batch(group_task)
 
     return ProcessImageTaskResult(
         batch_id=payload.batch_id,
@@ -770,6 +845,125 @@ def _ensure_classify_image_job(
             batch_id=image.batch_id,
             image_id=image.id,
             job_type=CLASSIFY_IMAGE_JOB_TYPE,
+            pipeline_version=pipeline_version,
+            idempotency_key=idempotency_key,
+        )
+    )
+    return task
+
+
+def ensure_group_batch_job_for_terminal_process_jobs(
+    session: Session,
+    *,
+    batch_id: UUID,
+    pipeline_version: str,
+) -> GroupBatchTaskPayload | None:
+    batch = session.scalar(
+        select(UploadBatch)
+        .where(
+            UploadBatch.id == batch_id,
+            UploadBatch.organization_id == DEFAULT_ORGANIZATION_ID,
+        )
+        .with_for_update()
+    )
+    if batch is None:
+        raise ProcessingBatchNotFoundError
+
+    task = _ensure_group_batch_job_if_process_jobs_terminal(
+        session,
+        batch=batch,
+        pipeline_version=pipeline_version,
+    )
+    session.commit()
+    return task
+
+
+def _commit_and_enqueue_group_task_if_ready(
+    session: Session,
+    *,
+    batch: UploadBatch,
+    pipeline_version: str,
+    queue: ProcessingQueue,
+) -> None:
+    group_task = _ensure_group_batch_job_if_process_jobs_terminal(
+        session,
+        batch=batch,
+        pipeline_version=pipeline_version,
+    )
+    session.commit()
+    if group_task is not None:
+        queue.enqueue_group_batch(group_task)
+
+
+def _ensure_group_batch_job_if_process_jobs_terminal(
+    session: Session,
+    *,
+    batch: UploadBatch,
+    pipeline_version: str,
+) -> GroupBatchTaskPayload | None:
+    if batch.status != "processing":
+        return None
+
+    process_jobs = session.scalars(
+        select(ProcessingJob)
+        .where(
+            ProcessingJob.organization_id == batch.organization_id,
+            ProcessingJob.batch_id == batch.id,
+            ProcessingJob.job_type == PROCESS_IMAGE_JOB_TYPE,
+            ProcessingJob.pipeline_version == pipeline_version,
+        )
+        .with_for_update()
+    ).all()
+    if not process_jobs:
+        return None
+    if any(job.status not in TERMINAL_PROCESSING_JOB_STATUSES for job in process_jobs):
+        return None
+    image_ids = [job.image_id for job in process_jobs if job.image_id is not None]
+    images_by_id = {
+        image.id: image
+        for image in session.scalars(
+            select(ImageAsset)
+            .where(
+                ImageAsset.organization_id == batch.organization_id,
+                ImageAsset.batch_id == batch.id,
+                ImageAsset.id.in_(image_ids),
+            )
+            .with_for_update()
+        ).all()
+    }
+    for job in process_jobs:
+        if job.image_id is None:
+            return None
+        image = images_by_id.get(job.image_id)
+        if image is None:
+            return None
+        if job.status == "completed" and image.status != "processed":
+            return None
+        if job.status == "failed" and image.status != "failed":
+            return None
+
+    idempotency_key = group_batch_idempotency_key(
+        batch_id=batch.id,
+        pipeline_version=pipeline_version,
+    )
+    existing_job = session.scalar(
+        select(ProcessingJob)
+        .where(ProcessingJob.idempotency_key == idempotency_key)
+        .with_for_update()
+    )
+    if existing_job is not None:
+        return None
+
+    task = GroupBatchTaskPayload(
+        batch_id=batch.id,
+        pipeline_version=pipeline_version,
+    )
+    session.add(
+        ProcessingJob(
+            organization_id=batch.organization_id,
+            batch_id=batch.id,
+            image_id=None,
+            job_type=GROUP_BATCH_JOB_TYPE,
             pipeline_version=pipeline_version,
             idempotency_key=idempotency_key,
         )

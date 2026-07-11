@@ -290,11 +290,13 @@ function ThumbnailPreview({
   onThumbnailError: (thumbnailKey: string) => void;
 }) {
   const thumbnailKey = thumbnailStateKey(image);
+  const isReadyForThumbnail =
+    image.imageStatus === "processed" && image.processJobStatus === "completed";
   const isUnavailable = failedThumbnailKeys.has(thumbnailKey);
 
   return (
     <div className="processing-thumbnail">
-      {isUnavailable ? (
+      {!isReadyForThumbnail || isUnavailable ? (
         <div className="thumbnail-placeholder">Thumbnail pending</div>
       ) : (
         // eslint-disable-next-line @next/next/no-img-element

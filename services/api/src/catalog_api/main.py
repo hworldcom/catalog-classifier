@@ -27,6 +27,12 @@ from catalog_api.image_uploads import (
     ValidatedJpeg,
     validate_jpeg_upload,
 )
+from catalog_api.grouping import (
+    GroupingBatchNotFoundError,
+    GroupingBatchStateError,
+    GroupingJobNotFoundError,
+    group_batch_task,
+)
 from catalog_api.local_batches import (
     MANIFEST_VERSION,
     BatchManifest,
@@ -38,6 +44,7 @@ from catalog_api.local_batches import (
 )
 from catalog_api.processing_jobs import (
     ClassifyImageTaskPayload,
+    GroupBatchTaskPayload,
     ProcessImageTaskPayload,
     ProcessingBatchNotFoundError,
     ProcessingBatchStateError,
@@ -154,6 +161,18 @@ class ClassifyImageTaskRequest(ApiModel):
 class ClassifyImageTaskResponse(ApiModel):
     batch_id: UUID = Field(serialization_alias="batchId")
     image_id: UUID = Field(serialization_alias="imageId")
+    pipeline_version: str = Field(serialization_alias="pipelineVersion")
+    job_status: str = Field(serialization_alias="jobStatus")
+    did_work: bool = Field(serialization_alias="didWork")
+
+
+class GroupBatchTaskRequest(ApiModel):
+    batch_id: UUID = Field(alias="batchId")
+    pipeline_version: StrictStr = Field(alias="pipelineVersion")
+
+
+class GroupBatchTaskResponse(ApiModel):
+    batch_id: UUID = Field(serialization_alias="batchId")
     pipeline_version: str = Field(serialization_alias="pipelineVersion")
     job_status: str = Field(serialization_alias="jobStatus")
     did_work: bool = Field(serialization_alias="didWork")
@@ -1016,6 +1035,45 @@ def classify_image_worker_task(
     return ClassifyImageTaskResponse(
         batch_id=result.batch_id,
         image_id=result.image_id,
+        pipeline_version=result.pipeline_version,
+        job_status=result.job_status,
+        did_work=result.did_work,
+    )
+
+
+@app.post(
+    "/internal/tasks/group-batch",
+    response_model=GroupBatchTaskResponse,
+    status_code=status.HTTP_200_OK,
+)
+def group_batch_worker_task(
+    request: GroupBatchTaskRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> GroupBatchTaskResponse:
+    try:
+        result = group_batch_task(
+            session,
+            payload=GroupBatchTaskPayload(
+                batch_id=request.batch_id,
+                pipeline_version=request.pipeline_version,
+            ),
+        )
+    except (GroupingBatchNotFoundError, GroupingJobNotFoundError) as error:
+        raise _processing_job_not_found() from error
+    except GroupingBatchStateError as error:
+        raise _processing_job_error(
+            code="invalid_batch_state",
+            message="Upload batch is not ready for grouping.",
+        ) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _processing_job_error(
+            code="database_error",
+            message="Unable to persist the batch grouping result.",
+        ) from error
+
+    return GroupBatchTaskResponse(
+        batch_id=result.batch_id,
         pipeline_version=result.pipeline_version,
         job_status=result.job_status,
         did_work=result.did_work,

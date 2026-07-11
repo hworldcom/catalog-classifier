@@ -36,6 +36,7 @@ from catalog_api.processing_jobs import (
     CLASSIFY_IMAGE_JOB_TYPE,
     PROCESS_IMAGE_JOB_TYPE,
     ClassifyImageTaskPayload,
+    GroupBatchTaskPayload,
     InMemoryProcessingQueue,
     ProcessingBatchStateError,
     claim_batch_for_processing,
@@ -535,6 +536,12 @@ async def test_process_image_worker_creates_derivatives_and_is_idempotent(
         ClassifyImageTaskPayload(
             batch_id=batch_id,
             image_id=image_id,
+            pipeline_version=PIPELINE_VERSION,
+        )
+    ]
+    assert fake_processing_queue.group_batch_tasks == [
+        GroupBatchTaskPayload(
+            batch_id=batch_id,
             pipeline_version=PIPELINE_VERSION,
         )
     ]
