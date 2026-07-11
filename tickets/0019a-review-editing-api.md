@@ -96,7 +96,7 @@ no-op successes and do not write review events.
 
 - Tickets `0017` and `0018` are complete.
 - The review read endpoint already exists and returns the proposed groups.
-- The review page will consume the API in ticket `0020`.
+- The review page will consume the API in ticket `0020a`.
 
 ## Acceptance Criteria
 

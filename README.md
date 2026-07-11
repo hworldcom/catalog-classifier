@@ -1661,7 +1661,7 @@ Keep this milestone narrow and vertical:
 2. Add the same-product grouping engine in ticket `0018`.
 3. Add the review editing API in ticket `0019a` and the approval workflow in
    ticket `0019b`.
-4. Add the review workbench UI in ticket `0020`.
+4. Add the review workbench UI across tickets `0020a` through `0020d`.
 
 Milestone 3 ends with proposed same-product groups stored in PostgreSQL and a
 review page that lets an operator correct and approve them.
