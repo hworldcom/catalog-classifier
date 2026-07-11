@@ -19,7 +19,7 @@ Build an internal catalog-ingestion application that allows a shop employee to:
 5. Merge, split, move, or remove images manually.
 6. Approve the final product groups.
 
-The first usable release ends with reviewed product groups stored in PostgreSQL. The first implementation milestone is upload foundation. Product codes, multilingual descriptions, and Sanity publication should be built as the next layer on the same architecture.
+The first usable release ends with reviewed product groups stored in PostgreSQL. The first implementation milestone is upload foundation. Product codes, multilingual descriptions, and Bazoria product-draft export should be built as the next layer on the same architecture.
 
 The system must favor precision over recall:
 
@@ -102,7 +102,7 @@ FastAPI owns:
 * workflow state;
 * review operations;
 * job creation;
-* Sanity publication commands.
+* Bazoria product-draft export commands.
 
 FastAPI must not perform image classification inside normal user-facing HTTP requests.
 
@@ -120,15 +120,15 @@ FastAPI must not perform image classification inside normal user-facing HTTP req
 ### Storage
 
 * Google Cloud Storage for temporary and original ingestion files
-* Sanity asset storage only after a product has been approved for publication
+* public asset storage only after a product has been approved for publication
 * PostgreSQL for metadata, workflow state, scores, vectors, and review actions
 
 ### Existing catalog integration
 
-* Sanity remains the public catalog CMS.
+* Bazoria Web owns the public catalog and product-draft persistence.
 * PostgreSQL becomes the operational ingestion database.
-* Do not use Sanity as the processing queue or image-grouping database.
-* Approved products are explicitly published from PostgreSQL into Sanity.
+* Do not use the classifier as the public catalog system.
+* Approved groups are explicitly exported from PostgreSQL into Bazoria Web.
 
 ---
 
@@ -171,7 +171,7 @@ Browser ───────────────► Private Cloud Storage b
         direct signed upload
 
 Approved products only:
-FastAPI / publication service ─────────► Sanity
+FastAPI / export service ───────────────► Bazoria Web
 ```
 
 ---
@@ -478,6 +478,9 @@ an internal category-suggestion provider interface and reads `GEMINI_API_KEY`
 from the worker environment. The category model defaults to `gemini-2.5-flash`
 and can be overridden with `CATALOG_CATEGORY_MODEL`. Automated tests use a fake
 provider rather than calling Gemini.
+The broader Bazoria taxonomy and seller-to-organization mapping are deferred to
+later tickets; the MVP continues with the current classifier organization model
+and seeded clothing categories.
 
 ### Stage F: Candidate-pair generation
 
@@ -511,7 +514,8 @@ different_product
 uncertain
 ```
 
-The decision should consider:
+The first pass should use deterministic signals only. The decision should
+consider:
 
 * embedding similarity;
 * whether category predictions agree;
@@ -520,7 +524,25 @@ The decision should consider:
 * whether differences indicate a genuinely different design;
 * whether colour differences represent variants of the same design.
 
-Use a multimodal comparison model only for ambiguous candidate pairs. Do not send every possible pair to the generative model.
+When both category predictions are known, category compatibility is a hard
+gate. Unknown or missing category suggestions are neutral.
+
+Use these threshold bands for pair decisions:
+
+* `same_product`: similarity clears the same-product threshold, the category
+  gate passes, and perceptual-hash distance is acceptable when both hashes are
+  available.
+* `uncertain`: similarity is between the uncertain and same-product
+  thresholds, or signals conflict, or missing evidence prevents a safe merge.
+* `different_product`: similarity falls below the uncertain threshold, or
+  known categories conflict.
+
+Missing embeddings or hashes do not fail grouping; they only reduce available
+evidence. When evidence is insufficient, keep the image singleton.
+
+If the deterministic signals are still too conservative, add multimodal
+comparison later in ticket `0021`. Do not send every possible pair to the
+generative model in the first grouping slice.
 
 Persist:
 
@@ -554,14 +576,26 @@ Use constrained agglomerative grouping:
 
 1. Start each non-duplicate image as its own group.
 2. Select a representative or medoid for each group.
-3. Merge only when the candidate image is sufficiently compatible with:
-
-   * the group representative; and
-   * the group overall.
+3. Merge only when the candidate image is sufficiently compatible with every
+   current member of the target group.
 4. Stop merging when confidence falls below the high-precision threshold.
 5. Leave uncertain images as singleton groups.
 
 Thresholds must be configuration values, not constants scattered through the code.
+
+Use these starting values:
+
+* `CATALOG_GROUPING_MAX_CANDIDATES_PER_IMAGE = 50`
+* `CATALOG_GROUPING_PHASH_MAX_DISTANCE = 8`
+* `CATALOG_GROUPING_UNCERTAIN_SIMILARITY_THRESHOLD = 0.80`
+* `CATALOG_GROUPING_SAME_PRODUCT_SIMILARITY_THRESHOLD = 0.92`
+
+Pairs below the uncertain threshold stay separate. Pairs between the uncertain
+and same-product thresholds remain uncertain. Only pairs that clear the
+same-product threshold and the category gate may merge.
+
+If proposed groups already exist for a batch, rerunning grouping is a no-op
+success that returns the existing groups unchanged.
 
 ---
 
@@ -786,6 +820,8 @@ this slice, which currently contains the category slug and confidence.
 
 ```text
 id
+organization_id
+batch_id
 image_a_id
 image_b_id
 embedding_similarity
@@ -798,6 +834,17 @@ decision_source
 pipeline_version
 created_at
 ```
+
+Store one row per unordered image pair and pipeline version. Canonicalize the
+image order before insert and enforce uniqueness on
+`(organization_id, batch_id, image_a_id, image_b_id, pipeline_version)`.
+Pair assessments are tenant- and batch-scoped.
+The application canonicalizes pair order, and the database rejects reversed
+rows with a check constraint.
+Use `CHECK` constraints for status and decision values, and require
+`image_a_id < image_b_id` for canonical pair storage.
+`decision_source` values are `heuristic`, `exact_duplicate`, and later
+`multimodal_model`. `singleton` is a group outcome, not a pair source.
 
 #### `product_groups`
 
@@ -815,9 +862,21 @@ created_at
 approved_at
 ```
 
+`product_groups.status` values are `proposed`, `approved`, and `rejected`.
+When grouping proposals are created, the batch moves from `processing` into
+`review_required`.
+
+`product_groups.cover_image_id` must point to the lowest `upload_order`
+non-duplicate image in the same organization and batch. `suggested_category_id`
+and `approved_category_id` are nullable foreign keys to `categories`.
+`product_groups.confidence` is the minimum accepted same-product pair
+confidence used to build the group, or `1.0` for singleton groups.
+
 #### `product_group_images`
 
 ```text
+organization_id
+batch_id
 group_id
 image_id
 position
@@ -827,17 +886,43 @@ is_duplicate
 duplicate_of_image_id
 ```
 
+Enforce one row per `(organization_id, batch_id, image_id)` and a unique
+`position` value per group. Use `organization_id` and `batch_id` to keep
+membership tenant- and batch-scoped and prevent cross-batch attachment.
+`membership_source` values are `engine`, `singleton`, `exact_duplicate`, and
+later `manual_review`.
+`membership_confidence` is nullable and should be `null` for singleton
+memberships.
+`position` follows the image `upload_order` within the group.
+`duplicate_of_image_id` must be null or point to another image in the same
+organization, batch, and group.
+
 #### `review_events`
 
 ```text
 id
 organization_id
 batch_id
-user_id
+group_id nullable
+image_id nullable
+user_id nullable
 action_type
 payload_json
 created_at
 ```
+
+Review events store the minimum audit data needed for review edits and approval
+tracking. Suggested `action_type` values are `create_group`, `move_image`,
+`remove_image`, `merge_groups`, `split_group`, `update_group`,
+`mark_duplicate`, `restore_duplicate`, `approve_group`, and `approve_batch`.
+Successful no-op requests do not write a review event.
+
+Implementation should use stricter database constraints where practical:
+
+* composite foreign keys using `(id, organization_id)` or
+  `(id, organization_id, batch_id)` where practical;
+* unique membership on `(organization_id, batch_id, image_id)`;
+* flexible JSON for `review_events.payload_json`.
 
 #### `processing_jobs`
 
@@ -861,7 +946,7 @@ Processing jobs use the statuses `pending`, `started`, `completed`, and `failed`
 
 #### `catalog_products`
 
-This becomes useful during the Sanity publication milestone:
+This becomes useful during the Bazoria product-draft export milestone:
 
 ```text
 id
@@ -869,7 +954,7 @@ organization_id
 product_code
 category_id
 status
-sanity_document_id
+bazoria_product_draft_id
 created_at
 published_at
 ```
@@ -893,14 +978,39 @@ POST   /v1/upload-batches/{batchId}/retry-failed
 
 ```text
 GET    /v1/upload-batches/{batchId}/groups
+POST   /v1/upload-batches/{batchId}/groups
 POST   /v1/groups/{groupId}/images
 DELETE /v1/groups/{groupId}/images/{imageId}
 POST   /v1/groups/merge
 POST   /v1/groups/{groupId}/split
 PATCH  /v1/groups/{groupId}
+PATCH  /v1/groups/{groupId}/images/{imageId}
 POST   /v1/groups/{groupId}/approve
 POST   /v1/upload-batches/{batchId}/approve
 ```
+
+`GET /v1/upload-batches/{batchId}/groups` returns a review snapshot when the
+batch status is `review_required` or `approved`. A review-ready batch with zero
+groups returns `groups: []`. An approved batch returns the same snapshot shape.
+Any other batch status returns `409` with `batch_not_review_ready`.
+The `thumbnailUrl` field in that snapshot uses the durable thumbnail endpoint
+`/v1/upload-batches/{batchId}/images/{imageId}/thumbnail`.
+`PATCH /v1/groups/{groupId}` is a partial patch: send either `coverImageId` or
+`approvedCategoryId` in one request. `approvedCategoryId` can be set to `null`
+to clear the approval. `coverImageId` must point to a non-duplicate member of
+the group.
+`PATCH /v1/groups/{groupId}/images/{imageId}` requires `isDuplicate: true` to
+include `duplicateOfImageId` pointing to another non-duplicate image in the
+same group. When `isDuplicate: false`, `duplicateOfImageId` must be `null`.
+Review edit endpoints only work when the batch status is `review_required`.
+Reject `processing`, `queued`, and `approved` batches.
+For `POST /v1/groups/{groupId}/split`, empty selections are invalid. Selecting
+images that already exactly match the current group membership is a no-op
+success. Selecting a single image is allowed and creates a singleton group.
+Batch approval only changes batch state; it does not mutate group memberships
+or duplicate flags.
+Every successful review mutation returns the updated review snapshot from
+`GET /v1/upload-batches/{batchId}/groups`.
 
 ### Processing API
 
@@ -912,6 +1022,11 @@ POST /internal/tasks/classify-image
 POST /internal/tasks/group-batch
 POST /internal/tasks/find-existing-products
 ```
+
+`POST /internal/tasks/group-batch` is the Milestone 3 grouping entrypoint. The
+backend creates one `group-batch` processing job when all `process-image`
+jobs for the batch are terminal, and local tests may call the same grouping
+service function synchronously.
 
 Milestone 2 prototype work uses a local fake queue and the local `process-image`
 and `classify-image` workers. Ticket `0016` adds Cloud Tasks and authenticated
@@ -942,6 +1057,9 @@ The worker should:
 4. mark the job as completed;
 5. return success.
 
+`process-image` job statuses are `pending`, `started`, `completed`, and
+`failed`. Terminal `process-image` statuses are `completed` and `failed`.
+
 Do not send image bytes through the task payload. Send only identifiers such as:
 
 ```json
@@ -954,31 +1072,34 @@ Do not send image bytes through the task payload. Send only identifiers such as:
 
 The worker retrieves the image from Cloud Storage.
 
+After a `process-image` job reaches a terminal state, the backend checks
+whether all `process-image` jobs for the batch are terminal. If yes, it creates
+exactly one `group-batch` `ProcessingJob` with an idempotency key. The local
+runner may execute the grouping service synchronously in tests and local
+development.
+
 When a `process-image` job completes successfully for an image, enqueue one
 `classify-image` job for the same image. Protect this with a database
 constraint or idempotency key so it is created only once.
-
-When all image-level jobs are complete, enqueue one batch-grouping job. Protect this with a database constraint or idempotency key so that it is created only once.
+Grouping uses only images whose `image_assets.status` is `processed`; failed
+images are excluded, and classification does not gate grouping.
 
 ---
 
-## 12. Sanity integration
+## 12. Bazoria product-draft export
 
-Do not upload every raw ingestion image into Sanity immediately.
+Do not export every raw ingestion image into Bazoria Web immediately.
 
-Publishing flow:
+Export flow:
 
 1. User approves the product group.
 2. Backend validates the product record.
-3. Approved images are uploaded to Sanity.
-4. Sanity asset references are stored in PostgreSQL.
-5. Product document is created or updated.
-6. Sanity document ID is persisted.
-7. The public catalog is revalidated.
+3. Approved groups are exported to Bazoria Web as product-draft payloads.
+4. Bazoria Web persists the product draft and handles public publication later.
 
-The backend must validate all required fields before making Sanity mutations.
+The backend must validate all required fields before exporting a product draft.
 
-Recommended product document fields:
+Recommended product-draft fields:
 
 ```text
 productCode
@@ -997,7 +1118,7 @@ status
 sourceBatchId
 ```
 
-Publishing must be explicit and initiated by an authorized user. Classification completion must never automatically publish a product.
+Exporting must be explicit and initiated by an authorized user. Classification completion must never automatically create a product draft.
 
 ---
 
@@ -1058,10 +1179,10 @@ Required controls:
 * non-public worker service;
 * JWT validation in FastAPI;
 * organization-level authorization on every query;
-* separate service accounts for API, worker, and publisher;
+* separate service accounts for API, worker, and exporter/integration;
 * secrets in Google Secret Manager or deployment environment secrets;
-* no Sanity write token in the browser;
-* audit records for merge, split, deletion, approval, and publication.
+* no Bazoria Web write token in the browser;
+* audit records for merge, split, deletion, approval, and export.
 
 The client-provided filename must never be used directly as a storage path.
 
@@ -1217,7 +1338,7 @@ Test:
 * worker retry behavior;
 * PostgreSQL vector persistence;
 * review actions;
-* Sanity publishing with a test dataset.
+* Bazoria product-draft export with a test dataset.
 
 ### End-to-end tests
 
@@ -1532,6 +1653,19 @@ Deliver:
 * merge, split, move, duplicate, and approve operations;
 * review-event logging.
 
+#### Milestone 3 implementation sequence
+
+Keep this milestone narrow and vertical:
+
+1. Add the grouping schema and review read model in ticket `0017`.
+2. Add the same-product grouping engine in ticket `0018`.
+3. Add the review editing API in ticket `0019a` and the approval workflow in
+   ticket `0019b`.
+4. Add the review workbench UI in ticket `0020`.
+
+Milestone 3 ends with proposed same-product groups stored in PostgreSQL and a
+review page that lets an operator correct and approve them.
+
 ### Milestone 4: Existing-catalog matching
 
 Deliver:
@@ -1541,15 +1675,14 @@ Deliver:
 * “possible existing product” suggestions;
 * no automatic linking during the first release.
 
-### Milestone 5: Catalog publication
+### Milestone 5: Bazoria product-draft export
 
 Deliver:
 
 * deterministic product codes;
 * multilingual structured descriptions;
-* Sanity asset upload;
-* Sanity product mutation;
-* publication status and retry handling.
+* Bazoria product-draft export;
+* export status and retry handling.
 
 ---
 
@@ -1586,4 +1719,4 @@ The release is complete when a user can:
 7. Rerun failed jobs safely without producing duplicate records.
 8. View a complete audit history of manual corrections.
 9. Process another organization’s data without any cross-organization visibility.
-10. Use the resulting approved groups as input for the later Sanity-publication stage.
+10. Use the resulting approved groups as input for the later Bazoria product-draft export stage.
