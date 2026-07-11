@@ -72,6 +72,20 @@ from catalog_api.review_groups import (
     ReviewBatchStateError,
     get_review_batch_groups,
 )
+from catalog_api.review_edits import (
+    ReviewEditBatchNotFoundError,
+    ReviewEditResourceNotFoundError,
+    ReviewEditStateError,
+    ReviewEditValidationError,
+    UpdateGroupPatch,
+    create_review_group,
+    merge_review_groups,
+    move_image_to_group,
+    remove_image_from_group,
+    split_review_group,
+    update_group_image_duplicate,
+    update_review_group,
+)
 from catalog_api.upload_batches import (
     InvalidUploadMetadataError,
     InvalidRetrySelectionError,
@@ -298,6 +312,33 @@ class ReviewBatchGroupsResponse(ApiModel):
     groups: list[ReviewGroupResponse]
 
 
+class CreateReviewGroupRequest(ApiModel):
+    image_ids: list[UUID] = Field(alias="imageIds")
+
+
+class MoveReviewGroupImageRequest(ApiModel):
+    image_id: UUID = Field(alias="imageId")
+
+
+class MergeReviewGroupsRequest(ApiModel):
+    target_group_id: UUID = Field(alias="targetGroupId")
+    source_group_ids: list[UUID] = Field(alias="sourceGroupIds")
+
+
+class SplitReviewGroupRequest(ApiModel):
+    image_ids: list[UUID] = Field(alias="imageIds")
+
+
+class UpdateReviewGroupRequest(ApiModel):
+    cover_image_id: UUID | None = Field(default=None, alias="coverImageId")
+    approved_category_id: UUID | None = Field(default=None, alias="approvedCategoryId")
+
+
+class UpdateReviewGroupImageRequest(ApiModel):
+    is_duplicate: bool = Field(alias="isDuplicate")
+    duplicate_of_image_id: UUID | None = Field(default=None, alias="duplicateOfImageId")
+
+
 class LocalBatchFileResult(ApiModel):
     image_id: UUID | None = Field(serialization_alias="imageId")
     original_filename: str = Field(serialization_alias="originalFilename")
@@ -367,7 +408,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_web_origins(),
     allow_credentials=False,
-    allow_methods=["GET", "PATCH", "POST"],
+    allow_methods=["DELETE", "GET", "PATCH", "POST"],
     allow_headers=["*"],
 )
 
@@ -494,6 +535,36 @@ def _review_batch_not_ready() -> HTTPException:
         detail={
             "code": "batch_not_review_ready",
             "message": "Upload batch has not entered the review phase.",
+        },
+    )
+
+
+def _review_edit_not_found(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "code": "review_resource_not_found",
+            "message": message,
+        },
+    )
+
+
+def _invalid_review_edit(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "code": "invalid_review_edit",
+            "message": message,
+        },
+    )
+
+
+def _review_edit_state_error(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "review_edit_not_allowed",
+            "message": message,
         },
     )
 
@@ -935,6 +1006,236 @@ def get_durable_upload_batch_groups(
         session.rollback()
         raise _upload_batch_database_error(
             "Unable to load upload batch review groups."
+        ) from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.post(
+    "/v1/upload-batches/{batch_id}/groups",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def create_durable_upload_batch_review_group(
+    batch_id: UUID,
+    request: CreateReviewGroupRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = create_review_group(
+            session,
+            batch_id=batch_id,
+            image_ids=request.image_ids,
+        )
+    except ReviewEditBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewEditResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewEditValidationError as error:
+        raise _invalid_review_edit(str(error)) from error
+    except ReviewEditStateError as error:
+        raise _review_edit_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to update upload batch review groups."
+        ) from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.post(
+    "/v1/groups/merge",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def merge_durable_review_groups(
+    request: MergeReviewGroupsRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = merge_review_groups(
+            session,
+            target_group_id=request.target_group_id,
+            source_group_ids=request.source_group_ids,
+        )
+    except ReviewEditBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewEditResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewEditValidationError as error:
+        raise _invalid_review_edit(str(error)) from error
+    except ReviewEditStateError as error:
+        raise _review_edit_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error("Unable to merge review groups.") from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.post(
+    "/v1/groups/{group_id}/images",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def move_durable_review_group_image(
+    group_id: UUID,
+    request: MoveReviewGroupImageRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = move_image_to_group(
+            session,
+            target_group_id=group_id,
+            image_id=request.image_id,
+        )
+    except ReviewEditBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewEditResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewEditValidationError as error:
+        raise _invalid_review_edit(str(error)) from error
+    except ReviewEditStateError as error:
+        raise _review_edit_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error("Unable to move review image.") from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.delete(
+    "/v1/groups/{group_id}/images/{image_id}",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def remove_durable_review_group_image(
+    group_id: UUID,
+    image_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = remove_image_from_group(
+            session,
+            group_id=group_id,
+            image_id=image_id,
+        )
+    except ReviewEditBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewEditResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewEditValidationError as error:
+        raise _invalid_review_edit(str(error)) from error
+    except ReviewEditStateError as error:
+        raise _review_edit_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error("Unable to remove review image.") from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.post(
+    "/v1/groups/{group_id}/split",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def split_durable_review_group(
+    group_id: UUID,
+    request: SplitReviewGroupRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = split_review_group(
+            session,
+            group_id=group_id,
+            image_ids=request.image_ids,
+        )
+    except ReviewEditBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewEditResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewEditValidationError as error:
+        raise _invalid_review_edit(str(error)) from error
+    except ReviewEditStateError as error:
+        raise _review_edit_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error("Unable to split review group.") from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.patch(
+    "/v1/groups/{group_id}",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def update_durable_review_group(
+    group_id: UUID,
+    request: UpdateReviewGroupRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    provided_fields = request.model_fields_set
+    patch = UpdateGroupPatch(
+        cover_image_id=request.cover_image_id,
+        approved_category_id=request.approved_category_id,
+        has_cover_image_id="cover_image_id" in provided_fields,
+        has_approved_category_id="approved_category_id" in provided_fields,
+    )
+    try:
+        snapshot = update_review_group(
+            session,
+            group_id=group_id,
+            patch=patch,
+        )
+    except ReviewEditBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewEditResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewEditValidationError as error:
+        raise _invalid_review_edit(str(error)) from error
+    except ReviewEditStateError as error:
+        raise _review_edit_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error("Unable to update review group.") from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.patch(
+    "/v1/groups/{group_id}/images/{image_id}",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def update_durable_review_group_image(
+    group_id: UUID,
+    image_id: UUID,
+    request: UpdateReviewGroupImageRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = update_group_image_duplicate(
+            session,
+            group_id=group_id,
+            image_id=image_id,
+            is_duplicate=request.is_duplicate,
+            duplicate_of_image_id=request.duplicate_of_image_id,
+        )
+    except ReviewEditBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewEditResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewEditValidationError as error:
+        raise _invalid_review_edit(str(error)) from error
+    except ReviewEditStateError as error:
+        raise _review_edit_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to update review group image."
         ) from error
 
     return _review_batch_groups_response(snapshot)
