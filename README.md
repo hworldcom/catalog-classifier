@@ -198,7 +198,10 @@ catalog-classifier/
 For the current local startup flow, including the commands to start each running
 component, see [`docs/local-start.md`](docs/local-start.md).
 
-The Next.js frontend must use a generated OpenAPI client. Do not manually duplicate request and response interfaces in Python and TypeScript.
+The Next.js frontend must use a generated OpenAPI client by default. Do not
+manually duplicate request and response interfaces in Python and TypeScript.
+Prototype slices may use handwritten helpers when a ticket explicitly says so;
+ticket `0020a` is one such temporary exception.
 
 ---
 
@@ -529,9 +532,12 @@ gate. Unknown or missing category suggestions are neutral.
 
 Use these threshold bands for pair decisions:
 
-* `same_product`: similarity clears the same-product threshold, the category
-  gate passes, and perceptual-hash distance is acceptable when both hashes are
-  available.
+* `same_product` normal path: similarity clears the same-product threshold, the
+  category gate passes, and perceptual-hash distance is acceptable when both
+  hashes are available.
+* `same_product` strong path: similarity clears the strong same-product
+  threshold and the category gate passes. This strong embedding signal may
+  override a perceptual-hash conflict.
 * `uncertain`: similarity is between the uncertain and same-product
   thresholds, or signals conflict, or missing evidence prevents a safe merge.
 * `different_product`: similarity falls below the uncertain threshold, or
@@ -588,11 +594,15 @@ Use these starting values:
 * `CATALOG_GROUPING_MAX_CANDIDATES_PER_IMAGE = 50`
 * `CATALOG_GROUPING_PHASH_MAX_DISTANCE = 8`
 * `CATALOG_GROUPING_UNCERTAIN_SIMILARITY_THRESHOLD = 0.80`
-* `CATALOG_GROUPING_SAME_PRODUCT_SIMILARITY_THRESHOLD = 0.92`
+* `CATALOG_GROUPING_SAME_PRODUCT_SIMILARITY_THRESHOLD = 0.85`
+* `CATALOG_GROUPING_STRONG_SAME_PRODUCT_SIMILARITY_THRESHOLD = 0.92`
 
 Pairs below the uncertain threshold stay separate. Pairs between the uncertain
-and same-product thresholds remain uncertain. Only pairs that clear the
-same-product threshold and the category gate may merge.
+and same-product thresholds remain uncertain. Pairs that clear the same-product
+threshold and the category gate may merge when perceptual-hash distance is
+acceptable. Pairs that clear the strong same-product threshold and the category
+gate may merge even when perceptual-hash distance is above the normal maximum.
+Known category conflicts always block automatic merging.
 
 If proposed groups already exist for a batch, rerunning grouping is a no-op
 success that returns the existing groups unchanged.
@@ -642,7 +652,7 @@ Required operations:
 * restore a duplicate;
 * change category;
 * select cover image;
-* reject an image;
+* image rejection is deferred (ticket `0022`);
 * approve a group.
 
 Every manual action must be stored as a review event.
@@ -978,6 +988,7 @@ POST   /v1/upload-batches/{batchId}/retry-failed
 
 ```text
 GET    /v1/upload-batches/{batchId}/groups
+GET    /v1/categories
 POST   /v1/upload-batches/{batchId}/groups
 POST   /v1/groups/{groupId}/images
 DELETE /v1/groups/{groupId}/images/{imageId}
@@ -995,6 +1006,14 @@ groups returns `groups: []`. An approved batch returns the same snapshot shape.
 Any other batch status returns `409` with `batch_not_review_ready`.
 The `thumbnailUrl` field in that snapshot uses the durable thumbnail endpoint
 `/v1/upload-batches/{batchId}/images/{imageId}/thumbnail`.
+`GET /v1/categories` returns the active global categories that power the
+review-page category selector.
+Categories are returned in deterministic tree order, then `nameEn` within each
+sibling set.
+The review page resolves `approvedCategorySlug` against that list before
+sending `approvedCategoryId` back to the backend.
+The review selector shows the full category tree, but only leaf categories are
+selectable in this prototype.
 `PATCH /v1/groups/{groupId}` is a partial patch: send either `coverImageId` or
 `approvedCategoryId` in one request. `approvedCategoryId` can be set to `null`
 to clear the approval. `coverImageId` must point to a non-duplicate member of
@@ -1004,6 +1023,8 @@ include `duplicateOfImageId` pointing to another non-duplicate image in the
 same group. When `isDuplicate: false`, `duplicateOfImageId` must be `null`.
 Review edit endpoints only work when the batch status is `review_required`.
 Reject `processing`, `queued`, and `approved` batches.
+Groups that are already approved remain read-only even while the batch is still
+`review_required`.
 For `POST /v1/groups/{groupId}/split`, empty selections are invalid. Selecting
 images that already exactly match the current group membership is a no-op
 success. Selecting a single image is allowed and creates a singleton group.
@@ -1011,6 +1032,22 @@ Batch approval only changes batch state; it does not mutate group memberships
 or duplicate flags.
 Every successful review mutation returns the updated review snapshot from
 `GET /v1/upload-batches/{batchId}/groups`.
+
+### Future Review API: Ticket 0022
+
+Image rejection is deferred. The active Review API contract does not include
+rejection endpoints or `isRejected` snapshot fields.
+
+If product later decides to add rejection, a likely shape is:
+
+* store rejection state on `product_group_images.is_rejected`;
+* expose `isRejected` in the review snapshot;
+* add reject and restore review actions and corresponding review events;
+* define how rejection interacts with cover images, duplicate masters, and
+  empty groups.
+
+Ticket `0022` will define those semantics if and when product decides to add
+them.
 
 ### Processing API
 
@@ -1650,7 +1687,7 @@ Deliver:
 * same-product scoring;
 * conservative grouping;
 * review interface;
-* merge, split, move, duplicate, and approve operations;
+* merge, split, move, duplicate, category, and approve operations;
 * review-event logging.
 
 #### Milestone 3 implementation sequence
@@ -1661,7 +1698,8 @@ Keep this milestone narrow and vertical:
 2. Add the same-product grouping engine in ticket `0018`.
 3. Add the review editing API in ticket `0019a` and the approval workflow in
    ticket `0019b`.
-4. Add the review workbench UI across tickets `0020a` through `0020d`.
+4. Add the review workbench UI across tickets `0020a` through `0020e`.
+   Ticket `0022` is deferred until image-rejection semantics are decided.
 
 Milestone 3 ends with proposed same-product groups stored in PostgreSQL and a
 review page that lets an operator correct and approve them.

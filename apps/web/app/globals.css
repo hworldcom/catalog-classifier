@@ -117,6 +117,17 @@ button:disabled {
   opacity: 0.5;
 }
 
+button.secondary-action {
+  min-height: 2.5rem;
+  border: 1px solid var(--accent);
+  background: white;
+  color: var(--accent);
+}
+
+button.secondary-action:hover:not(:disabled) {
+  background: #edf6f1;
+}
+
 .message {
   display: grid;
   gap: 0.75rem;
@@ -294,6 +305,10 @@ button:disabled {
   grid-template-columns: minmax(0, 2fr) repeat(3, minmax(7rem, 1fr));
 }
 
+.review-summary {
+  grid-template-columns: minmax(0, 2fr) repeat(4, minmax(7rem, 1fr));
+}
+
 .group-grid {
   display: grid;
   gap: 1.5rem;
@@ -311,6 +326,12 @@ button:disabled {
   background: var(--card);
 }
 
+.review-edit-toolbars {
+  display: grid;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
 .selection-toolbar div {
   display: grid;
   gap: 0.2rem;
@@ -326,8 +347,92 @@ button:disabled {
   padding-inline: 1rem;
 }
 
+.merge-toolbar {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) minmax(12rem, 16rem) minmax(12rem, 1fr) auto;
+  gap: 1rem;
+  align-items: end;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--card);
+}
+
+.merge-toolbar > div,
+.merge-toolbar label {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.merge-toolbar span,
+.merge-toolbar legend {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.merge-toolbar strong {
+  color: var(--text);
+}
+
+.merge-toolbar select {
+  min-height: 2.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: white;
+  color: var(--text);
+  padding-inline: 0.6rem;
+}
+
+.merge-toolbar fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.merge-source-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  padding-top: 0.4rem;
+}
+
+.merge-source-list label {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: center;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.merge-toolbar button {
+  min-width: 6rem;
+  padding-inline: 1rem;
+}
+
 .review-action-error {
   margin: 0 0 1.5rem;
+}
+
+.review-readonly-note {
+  margin: 0 0 1.5rem;
+}
+
+.empty-review-state {
+  padding: clamp(1.25rem, 3vw, 2rem);
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  background: var(--card);
+  color: var(--muted);
+}
+
+.empty-review-state h2 {
+  margin: 0 0 0.5rem;
+  color: var(--text);
+}
+
+.empty-review-state p {
+  margin: 0;
 }
 
 .group-card {
@@ -359,7 +464,8 @@ button:disabled {
 
 .group-kind,
 .retained-label,
-.duplicate-label {
+.duplicate-label,
+.cover-label {
   display: inline-flex;
   align-items: center;
   min-height: 1.75rem;
@@ -374,6 +480,83 @@ button:disabled {
 .group-kind {
   background: #edf1ef;
   color: var(--muted);
+}
+
+.group-details,
+.image-details {
+  display: grid;
+  gap: 1px;
+  margin: 0 0 1rem;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--border);
+}
+
+.group-details {
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+}
+
+.image-details {
+  grid-template-columns: 1fr;
+}
+
+.group-details div,
+.image-details div {
+  min-width: 0;
+  padding: 0.75rem;
+  background: white;
+}
+
+.group-details dt,
+.image-details dt {
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.group-details dd,
+.image-details dd {
+  margin: 0.3rem 0 0;
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.warning-list {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0 0 1rem;
+  padding: 0.75rem 0.75rem 0.75rem 1.75rem;
+  border-radius: 0.75rem;
+  background: var(--warning);
+  color: #705500;
+  font-size: 0.85rem;
+}
+
+.group-edit-actions {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: #f8faf8;
+}
+
+.group-edit-actions span {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.group-edit-actions button {
+  min-height: 2.5rem;
+  padding-inline: 0.9rem;
 }
 
 .image-grid {
@@ -411,6 +594,14 @@ button:disabled {
   accent-color: var(--accent);
 }
 
+.image-position {
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
 .thumbnail-link {
   display: block;
   aspect-ratio: 1;
@@ -428,6 +619,12 @@ button:disabled {
   gap: 0.6rem;
   align-items: center;
   padding: 0.75rem;
+}
+
+.review-image-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
 }
 
 .filename {
@@ -450,15 +647,32 @@ button:disabled {
   color: #705500;
 }
 
+.cover-label {
+  width: fit-content;
+  background: #e5edf5;
+  color: #4d5f75;
+}
+
 .move-controls {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: 1fr;
   gap: 0.5rem;
-  align-items: end;
+}
+
+.image-edit-controls {
+  display: grid;
+  gap: 0.75rem;
   padding: 0 0.75rem 0.75rem;
 }
 
-.move-controls label {
+.duplicate-controls {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.5rem;
+}
+
+.move-controls label,
+.duplicate-controls label {
   display: grid;
   gap: 0.3rem;
   min-width: 0;
@@ -467,7 +681,8 @@ button:disabled {
   font-weight: 700;
 }
 
-.move-controls select {
+.move-controls select,
+.duplicate-controls select {
   min-width: 0;
   min-height: 2.5rem;
   border: 1px solid var(--border);
@@ -477,9 +692,11 @@ button:disabled {
   padding-inline: 0.6rem;
 }
 
-.move-controls button {
+.move-controls button,
+.duplicate-controls button {
   min-height: 2.5rem;
   padding-inline: 0.8rem;
+  width: 100%;
 }
 
 .processing-results {
@@ -588,11 +805,25 @@ button:disabled {
   }
 
   .batch-summary,
-  .processing-summary {
+  .processing-summary,
+  .review-summary {
     grid-template-columns: 1fr;
   }
 
   .selection-toolbar {
     display: grid;
+  }
+
+  .merge-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .group-edit-actions {
+    display: grid;
+  }
+
+  .move-controls,
+  .duplicate-controls {
+    grid-template-columns: 1fr;
   }
 }

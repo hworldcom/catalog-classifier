@@ -55,13 +55,18 @@ def anyio_backend() -> str:
 async def test_group_batch_worker_creates_same_product_group(
     database_client: AsyncClient,
     migrated_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv(
+        "CATALOG_GROUPING_SAME_PRODUCT_SIMILARITY_THRESHOLD",
+        raising=False,
+    )
     with Session(migrated_engine) as session:
         batch_id, image_ids = _create_grouping_batch(
             session,
             specs=[
                 GroupingImageSpec(upload_order=0, embedding=(1.0, 0.0)),
-                GroupingImageSpec(upload_order=1, embedding=(0.99, 0.10)),
+                GroupingImageSpec(upload_order=1, embedding=(0.88, 0.475)),
             ],
         )
 
@@ -104,6 +109,179 @@ async def test_group_batch_worker_creates_same_product_group(
     assert assessment is not None
     assert assessment.decision == "same_product"
     assert assessment.decision_source == "heuristic"
+    assert assessment.confidence is not None
+    assert 0.85 <= assessment.confidence < 0.92
+
+
+async def test_group_batch_strong_similarity_overrides_phash_conflict(
+    migrated_engine: Engine,
+) -> None:
+    with Session(migrated_engine) as session:
+        batch_id, image_ids = _create_grouping_batch(
+            session,
+            specs=[
+                GroupingImageSpec(
+                    upload_order=0,
+                    embedding=(1.0, 0.0),
+                    phash="0000000000000000",
+                ),
+                GroupingImageSpec(
+                    upload_order=1,
+                    embedding=(0.9254, 0.37899187326379447),
+                    phash="00000000000fffff",
+                ),
+            ],
+        )
+
+    with Session(migrated_engine) as session:
+        result = group_batch_task(
+            session,
+            payload=GroupBatchTaskPayload(
+                batch_id=batch_id,
+                pipeline_version=PIPELINE_VERSION,
+            ),
+            settings=_default_grouping_settings(),
+        )
+
+    assert result.did_work is True
+    with Session(migrated_engine) as session:
+        groups = session.scalars(
+            select(ProductGroup).where(ProductGroup.batch_id == batch_id)
+        ).all()
+        memberships = session.scalars(
+            select(ProductGroupImage)
+            .where(ProductGroupImage.batch_id == batch_id)
+            .order_by(ProductGroupImage.position)
+        ).all()
+        assessment = session.scalar(
+            select(PairAssessment).where(PairAssessment.batch_id == batch_id)
+        )
+
+    assert len(groups) == 1
+    assert [membership.image_id for membership in memberships] == image_ids
+    assert assessment is not None
+    assert assessment.decision == "same_product"
+    assert assessment.confidence is not None
+    assert assessment.confidence >= 0.92
+    assert assessment.phash_distance is not None
+    assert assessment.phash_distance > 8
+
+
+async def test_group_batch_borderline_similarity_keeps_phash_conflict_uncertain(
+    migrated_engine: Engine,
+) -> None:
+    with Session(migrated_engine) as session:
+        batch_id, image_ids = _create_grouping_batch(
+            session,
+            specs=[
+                GroupingImageSpec(
+                    upload_order=0,
+                    embedding=(1.0, 0.0),
+                    phash="0000000000000000",
+                ),
+                GroupingImageSpec(
+                    upload_order=1,
+                    embedding=(0.8945, 0.4470679478558042),
+                    phash="00000000000fffff",
+                ),
+            ],
+        )
+
+    with Session(migrated_engine) as session:
+        result = group_batch_task(
+            session,
+            payload=GroupBatchTaskPayload(
+                batch_id=batch_id,
+                pipeline_version=PIPELINE_VERSION,
+            ),
+            settings=_default_grouping_settings(),
+        )
+
+    assert result.did_work is True
+    with Session(migrated_engine) as session:
+        group_sizes = session.scalars(
+            select(func.count(ProductGroupImage.image_id))
+            .where(ProductGroupImage.batch_id == batch_id)
+            .group_by(ProductGroupImage.group_id)
+            .order_by(func.count(ProductGroupImage.image_id))
+        ).all()
+        grouped_image_ids = set(
+            session.scalars(
+                select(ProductGroupImage.image_id).where(
+                    ProductGroupImage.batch_id == batch_id
+                )
+            ).all()
+        )
+        assessment = session.scalar(
+            select(PairAssessment).where(PairAssessment.batch_id == batch_id)
+        )
+
+    assert group_sizes == [1, 1]
+    assert grouped_image_ids == set(image_ids)
+    assert assessment is not None
+    assert assessment.decision == "uncertain"
+    assert assessment.confidence is not None
+    assert 0.85 <= assessment.confidence < 0.92
+    assert assessment.phash_distance is not None
+    assert assessment.phash_distance > 8
+
+
+async def test_group_batch_category_conflict_blocks_strong_similarity(
+    migrated_engine: Engine,
+) -> None:
+    with Session(migrated_engine) as session:
+        batch_id, image_ids = _create_grouping_batch(
+            session,
+            specs=[
+                GroupingImageSpec(
+                    upload_order=0,
+                    embedding=(1.0, 0.0),
+                    category_slug="t-shirts",
+                    phash="0000000000000000",
+                ),
+                GroupingImageSpec(
+                    upload_order=1,
+                    embedding=(0.9254, 0.37899187326379447),
+                    category_slug="trousers",
+                    phash="0000000000000000",
+                ),
+            ],
+        )
+
+    with Session(migrated_engine) as session:
+        result = group_batch_task(
+            session,
+            payload=GroupBatchTaskPayload(
+                batch_id=batch_id,
+                pipeline_version=PIPELINE_VERSION,
+            ),
+            settings=_default_grouping_settings(),
+        )
+
+    assert result.did_work is True
+    with Session(migrated_engine) as session:
+        group_sizes = session.scalars(
+            select(func.count(ProductGroupImage.image_id))
+            .where(ProductGroupImage.batch_id == batch_id)
+            .group_by(ProductGroupImage.group_id)
+            .order_by(func.count(ProductGroupImage.image_id))
+        ).all()
+        grouped_image_ids = set(
+            session.scalars(
+                select(ProductGroupImage.image_id).where(
+                    ProductGroupImage.batch_id == batch_id
+                )
+            ).all()
+        )
+        assessment = session.scalar(
+            select(PairAssessment).where(PairAssessment.batch_id == batch_id)
+        )
+
+    assert group_sizes == [1, 1]
+    assert grouped_image_ids == set(image_ids)
+    assert assessment is not None
+    assert assessment.decision == "different_product"
+    assert assessment.category_match is False
     assert assessment.confidence is not None
     assert assessment.confidence >= 0.92
 
@@ -378,4 +556,15 @@ def _strict_grouping_settings() -> GroupingSettings:
         phash_max_distance=8,
         uncertain_similarity_threshold=0.80,
         same_product_similarity_threshold=0.92,
+        strong_same_product_similarity_threshold=0.92,
+    )
+
+
+def _default_grouping_settings() -> GroupingSettings:
+    return GroupingSettings(
+        max_candidates_per_image=50,
+        phash_max_distance=8,
+        uncertain_similarity_threshold=0.80,
+        same_product_similarity_threshold=0.85,
+        strong_same_product_similarity_threshold=0.92,
     )

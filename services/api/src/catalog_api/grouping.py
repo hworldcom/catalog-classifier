@@ -57,6 +57,7 @@ class GroupingSettings:
     phash_max_distance: int
     uncertain_similarity_threshold: float
     same_product_similarity_threshold: float
+    strong_same_product_similarity_threshold: float
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,10 @@ def grouping_settings_from_env() -> GroupingSettings:
         ),
         same_product_similarity_threshold=_read_float_setting(
             "CATALOG_GROUPING_SAME_PRODUCT_SIMILARITY_THRESHOLD",
+            0.85,
+        ),
+        strong_same_product_similarity_threshold=_read_float_setting(
+            "CATALOG_GROUPING_STRONG_SAME_PRODUCT_SIMILARITY_THRESHOLD",
             0.92,
         ),
     )
@@ -416,7 +421,13 @@ def _heuristic_decision(
     elif similarity < settings.uncertain_similarity_threshold:
         decision = DECISION_DIFFERENT_PRODUCT
         confidence = similarity
-    elif similarity >= settings.same_product_similarity_threshold and not phash_conflicts:
+    elif (
+        similarity >= settings.strong_same_product_similarity_threshold
+        or (
+            similarity >= settings.same_product_similarity_threshold
+            and not phash_conflicts
+        )
+    ):
         decision = DECISION_SAME_PRODUCT
         confidence = similarity
     else:
