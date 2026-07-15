@@ -525,6 +525,38 @@ button.secondary-action:hover:not(:disabled) {
   font-weight: 700;
 }
 
+.category-control {
+  display: grid;
+  gap: 0.5rem;
+  font-weight: 400;
+}
+
+.category-control select {
+  min-width: 0;
+  min-height: 2.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: white;
+  color: var(--text);
+  padding-inline: 0.6rem;
+}
+
+.category-stale-note {
+  color: #8d2525;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.category-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+.category-actions button {
+  width: 100%;
+}
+
 .warning-list {
   display: grid;
   gap: 0.4rem;
@@ -820,6 +852,10 @@ button.secondary-action:hover:not(:disabled) {
 
   .group-edit-actions {
     display: grid;
+  }
+
+  .category-actions {
+    grid-template-columns: 1fr;
   }
 
   .move-controls,

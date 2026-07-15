@@ -5,35 +5,63 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import ReviewBatch from "@/app/admin/review/[batchId]/review-batch";
 import {
   ReviewBatchGroups,
+  ReviewCategory,
   createReviewGroup,
+  loadReviewCategories,
   loadReviewBatchGroups,
   mergeReviewGroups,
   moveReviewImage,
   reviewBatchAssetUrl,
   splitReviewGroup,
+  updateReviewGroupCategory,
   updateReviewGroupCover,
   updateReviewImageDuplicate,
 } from "@/lib/review-batches";
 
 vi.mock("@/lib/review-batches", () => ({
   createReviewGroup: vi.fn(),
+  loadReviewCategories: vi.fn(),
   loadReviewBatchGroups: vi.fn(),
   mergeReviewGroups: vi.fn(),
   moveReviewImage: vi.fn(),
   reviewBatchAssetUrl: vi.fn((path: string) => `http://api.test${path}`),
   splitReviewGroup: vi.fn(),
+  updateReviewGroupCategory: vi.fn(),
   updateReviewGroupCover: vi.fn(),
   updateReviewImageDuplicate: vi.fn(),
 }));
 
 const createReviewGroupMock = vi.mocked(createReviewGroup);
+const loadReviewCategoriesMock = vi.mocked(loadReviewCategories);
 const loadReviewBatchGroupsMock = vi.mocked(loadReviewBatchGroups);
 const mergeReviewGroupsMock = vi.mocked(mergeReviewGroups);
 const moveReviewImageMock = vi.mocked(moveReviewImage);
 const reviewBatchAssetUrlMock = vi.mocked(reviewBatchAssetUrl);
 const splitReviewGroupMock = vi.mocked(splitReviewGroup);
+const updateReviewGroupCategoryMock = vi.mocked(updateReviewGroupCategory);
 const updateReviewGroupCoverMock = vi.mocked(updateReviewGroupCover);
 const updateReviewImageDuplicateMock = vi.mocked(updateReviewImageDuplicate);
+
+const reviewCategories: ReviewCategory[] = [
+  {
+    id: "category-clothing",
+    slug: "clothing",
+    parentId: null,
+    nameEn: "Clothing",
+  },
+  {
+    id: "category-t-shirts",
+    slug: "t-shirts",
+    parentId: "category-clothing",
+    nameEn: "T-shirts",
+  },
+  {
+    id: "category-trousers",
+    slug: "trousers",
+    parentId: "category-clothing",
+    nameEn: "Trousers",
+  },
+];
 
 const reviewSnapshot: ReviewBatchGroups = {
   batchId: "batch-1",
@@ -104,13 +132,16 @@ const reviewSnapshot: ReviewBatchGroups = {
 describe("ReviewBatch", () => {
   beforeEach(() => {
     createReviewGroupMock.mockReset();
+    loadReviewCategoriesMock.mockReset();
     loadReviewBatchGroupsMock.mockReset();
     mergeReviewGroupsMock.mockReset();
     moveReviewImageMock.mockReset();
     reviewBatchAssetUrlMock.mockClear();
     splitReviewGroupMock.mockReset();
+    updateReviewGroupCategoryMock.mockReset();
     updateReviewGroupCoverMock.mockReset();
     updateReviewImageDuplicateMock.mockReset();
+    loadReviewCategoriesMock.mockResolvedValue(reviewCategories);
   });
 
   it("renders a durable review snapshot with basic edit controls", async () => {
@@ -130,7 +161,12 @@ describe("ReviewBatch", () => {
     expect(screen.getByText("Duplicate")).toBeInTheDocument();
     expect(screen.getAllByText("Member")).toHaveLength(2);
     expect(screen.getByText("t-shirts")).toBeInTheDocument();
-    expect(screen.getByText("trousers")).toBeInTheDocument();
+    expect(screen.getByLabelText("Approved category for Group 1")).toHaveValue("");
+    expect(screen.getByLabelText("Approved category for Group 2")).toHaveValue(
+      "category-trousers",
+    );
+    expect(screen.getAllByRole("option", { name: "Clothing" })[0]).toBeDisabled();
+    expect(screen.getAllByRole("option", { name: "T-shirts" })[0]).toBeEnabled();
     expect(screen.getAllByText("0.94")).toHaveLength(2);
     expect(screen.getByText("product-1")).toBeInTheDocument();
     expect(
@@ -151,6 +187,7 @@ describe("ReviewBatch", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Restore duplicate" })).toBeInTheDocument();
     expect(loadReviewBatchGroupsMock).toHaveBeenCalledWith("batch-1");
+    expect(loadReviewCategoriesMock).toHaveBeenCalled();
     expect(reviewBatchAssetUrlMock).toHaveBeenCalledWith(
       "/v1/upload-batches/batch-1/images/image-1/thumbnail",
     );
@@ -348,6 +385,88 @@ describe("ReviewBatch", () => {
     expect(await screen.findAllByText("Cover")).toHaveLength(2);
   });
 
+  it("updates and clears an approved category", async () => {
+    const user = userEvent.setup();
+    const categorySnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: [
+        {
+          ...reviewSnapshot.groups[0],
+          approvedCategorySlug: "t-shirts",
+        },
+        reviewSnapshot.groups[1],
+      ],
+    };
+    const clearedSnapshot: ReviewBatchGroups = {
+      ...categorySnapshot,
+      groups: [
+        categorySnapshot.groups[0],
+        {
+          ...categorySnapshot.groups[1],
+          approvedCategorySlug: null,
+        },
+      ],
+    };
+    loadReviewBatchGroupsMock.mockResolvedValue(reviewSnapshot);
+    updateReviewGroupCategoryMock
+      .mockResolvedValueOnce(categorySnapshot)
+      .mockResolvedValueOnce(clearedSnapshot);
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    await user.selectOptions(
+      await screen.findByLabelText("Approved category for Group 1"),
+      "category-t-shirts",
+    );
+    await user.click(screen.getByLabelText("Save category for Group 1"));
+
+    expect(updateReviewGroupCategoryMock).toHaveBeenCalledWith(
+      "group-1",
+      "category-t-shirts",
+    );
+
+    await user.click(await screen.findByLabelText("Clear category for Group 2"));
+
+    expect(updateReviewGroupCategoryMock).toHaveBeenLastCalledWith("group-2", null);
+  });
+
+  it("shows stale approved categories and allows clearing them", async () => {
+    const user = userEvent.setup();
+    const staleSnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: [
+        reviewSnapshot.groups[0],
+        {
+          ...reviewSnapshot.groups[1],
+          approvedCategorySlug: "archived-trousers",
+        },
+      ],
+    };
+    loadReviewBatchGroupsMock.mockResolvedValue(staleSnapshot);
+    updateReviewGroupCategoryMock.mockResolvedValue({
+      ...staleSnapshot,
+      groups: [
+        staleSnapshot.groups[0],
+        {
+          ...staleSnapshot.groups[1],
+          approvedCategorySlug: null,
+        },
+      ],
+    });
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    expect(
+      await screen.findByText(
+        "Current approved category is inactive or missing: archived-trousers",
+      ),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByLabelText("Clear category for Group 2"));
+
+    expect(updateReviewGroupCategoryMock).toHaveBeenCalledWith("group-2", null);
+  });
+
   it("marks a non-duplicate image as duplicate of another group image", async () => {
     const user = userEvent.setup();
     const markedSnapshot: ReviewBatchGroups = {
@@ -470,8 +589,13 @@ describe("ReviewBatch", () => {
     expect(
       screen.queryByLabelText("Target group for front.jpg"),
     ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Approved category for Group 1")).toBeDisabled();
+    expect(
+      screen.queryByLabelText("Save category for Group 1"),
+    ).not.toBeInTheDocument();
     expect(screen.getByLabelText("Select back.jpg")).toBeInTheDocument();
     expect(screen.getByLabelText("Target group for back.jpg")).toBeDisabled();
+    expect(screen.getByLabelText("Approved category for Group 2")).toBeEnabled();
   });
 
   it("disables edit controls while a write is pending", async () => {
@@ -525,6 +649,26 @@ describe("ReviewBatch", () => {
     );
   });
 
+  it("shows action errors from failed category updates", async () => {
+    const user = userEvent.setup();
+    loadReviewBatchGroupsMock.mockResolvedValue(reviewSnapshot);
+    updateReviewGroupCategoryMock.mockRejectedValue(
+      new Error("approvedCategoryId must be a leaf category."),
+    );
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    await user.selectOptions(
+      await screen.findByLabelText("Approved category for Group 1"),
+      "category-t-shirts",
+    );
+    await user.click(screen.getByLabelText("Save category for Group 1"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "approvedCategoryId must be a leaf category.",
+    );
+  });
+
   it("renders an empty review-ready batch", async () => {
     loadReviewBatchGroupsMock.mockResolvedValue({
       ...reviewSnapshot,
@@ -560,6 +704,7 @@ describe("ReviewBatch", () => {
     expect(screen.getAllByText("approved")).toHaveLength(3);
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Select front.jpg")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Approved category for Group 1")).toBeDisabled();
   });
 
   it("shows a load error", async () => {

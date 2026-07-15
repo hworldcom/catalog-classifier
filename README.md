@@ -1012,11 +1012,12 @@ Categories are returned in deterministic tree order, then `nameEn` within each
 sibling set.
 The review page resolves `approvedCategorySlug` against that list before
 sending `approvedCategoryId` back to the backend.
-The review selector shows the full category tree, but only leaf categories are
-selectable in this prototype.
+The review selector shows the full category tree. Parent categories remain
+visible but disabled; only leaf categories are selectable in this prototype.
 `PATCH /v1/groups/{groupId}` is a partial patch: send either `coverImageId` or
 `approvedCategoryId` in one request. `approvedCategoryId` can be set to `null`
-to clear the approval. `coverImageId` must point to a non-duplicate member of
+to clear the approval. Non-null `approvedCategoryId` must point to an active
+global leaf category. `coverImageId` must point to a non-duplicate member of
 the group.
 `PATCH /v1/groups/{groupId}/images/{imageId}` requires `isDuplicate: true` to
 include `duplicateOfImageId` pointing to another non-duplicate image in the

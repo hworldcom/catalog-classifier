@@ -523,11 +523,25 @@ def _category(session: Session, *, category_id: UUID) -> Category:
     category = session.scalar(
         select(Category).where(
             Category.id == category_id,
+            Category.organization_id.is_(None),
             Category.active.is_(True),
         )
     )
     if category is None:
-        raise ReviewEditValidationError("approvedCategoryId must be an active category.")
+        raise ReviewEditValidationError(
+            "approvedCategoryId must be an active global category."
+        )
+    child_category_id = session.scalar(
+        select(Category.id)
+        .where(
+            Category.parent_id == category_id,
+            Category.organization_id.is_(None),
+            Category.active.is_(True),
+        )
+        .limit(1)
+    )
+    if child_category_id is not None:
+        raise ReviewEditValidationError("approvedCategoryId must be a leaf category.")
     return category
 
 

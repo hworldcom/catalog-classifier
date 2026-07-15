@@ -3,11 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ReviewBatchError,
   createReviewGroup,
+  loadReviewCategories,
   loadReviewBatchGroups,
   mergeReviewGroups,
   moveReviewImage,
   reviewBatchAssetUrl,
   splitReviewGroup,
+  updateReviewGroupCategory,
   updateReviewGroupCover,
   updateReviewImageDuplicate,
 } from "@/lib/review-batches";
@@ -43,6 +45,26 @@ describe("review batch client", () => {
     );
   });
 
+  it("loads review categories", async () => {
+    const responseBody = [
+      {
+        id: "category-1",
+        slug: "clothing",
+        parentId: null,
+        nameEn: "Clothing",
+      },
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(responseBody));
+
+    await expect(
+      loadReviewCategories(fetchMock as typeof fetch, "http://api.example.test/"),
+    ).resolves.toEqual(responseBody);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://api.example.test/v1/categories",
+    );
+  });
+
   it("surfaces backend review errors", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(
@@ -75,6 +97,7 @@ describe("review batch client", () => {
     };
     const fetchMock = vi
       .fn()
+      .mockResolvedValueOnce(jsonResponse(responseBody))
       .mockResolvedValueOnce(jsonResponse(responseBody))
       .mockResolvedValueOnce(jsonResponse(responseBody))
       .mockResolvedValueOnce(jsonResponse(responseBody))
@@ -119,6 +142,14 @@ describe("review batch client", () => {
       updateReviewGroupCover(
         "group-1",
         "image-2",
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(responseBody);
+    await expect(
+      updateReviewGroupCategory(
+        "group-1",
+        "category-1",
         fetchMock as typeof fetch,
         "http://api.example.test/",
       ),
@@ -192,6 +223,15 @@ describe("review batch client", () => {
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       6,
+      "http://api.example.test/v1/groups/group-1",
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approvedCategoryId: "category-1" }),
+      },
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      7,
       "http://api.example.test/v1/groups/group-1/images/image-2",
       {
         method: "PATCH",
@@ -203,7 +243,7 @@ describe("review batch client", () => {
       },
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      7,
+      8,
       "http://api.example.test/v1/groups/group-1/images/image-2",
       {
         method: "PATCH",

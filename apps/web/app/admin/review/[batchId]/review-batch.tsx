@@ -4,14 +4,17 @@ import { useEffect, useState } from "react";
 
 import {
   ReviewBatchGroups,
+  ReviewCategory,
   ReviewGroup,
   ReviewGroupImage,
   createReviewGroup,
+  loadReviewCategories,
   loadReviewBatchGroups,
   mergeReviewGroups,
   moveReviewImage,
   reviewBatchAssetUrl,
   splitReviewGroup,
+  updateReviewGroupCategory,
   updateReviewGroupCover,
   updateReviewImageDuplicate,
 } from "@/lib/review-batches";
@@ -22,6 +25,7 @@ type ReviewBatchProps = {
 
 export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   const [snapshot, setSnapshot] = useState<ReviewBatchGroups | null>(null);
+  const [categories, setCategories] = useState<ReviewCategory[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
@@ -37,11 +41,15 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   useEffect(() => {
     let isCurrent = true;
 
-    async function loadSnapshot() {
+    async function loadReviewData() {
       try {
-        const loadedSnapshot = await loadReviewBatchGroups(batchId);
+        const [loadedSnapshot, loadedCategories] = await Promise.all([
+          loadReviewBatchGroups(batchId),
+          loadReviewCategories(),
+        ]);
         if (isCurrent) {
           setSnapshot(loadedSnapshot);
+          setCategories(loadedCategories);
           setError(null);
         }
       } catch (loadError) {
@@ -55,7 +63,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
       }
     }
 
-    void loadSnapshot();
+    void loadReviewData();
     return () => {
       isCurrent = false;
     };
@@ -80,7 +88,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
     );
   }
 
-  if (!snapshot) {
+  if (!snapshot || !categories) {
     return (
       <main className="review-shell">
         <p className="loading-state" aria-live="polite">
@@ -240,6 +248,28 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
       resetEditSelections();
     } catch (coverError) {
       setActionError(errorMessage(coverError, "The cover image could not be updated."));
+    } finally {
+      setIsEditing(false);
+    }
+  }
+
+  async function handleUpdateCategory(
+    groupId: string,
+    approvedCategoryId: string | null,
+  ) {
+    setIsEditing(true);
+    setActionError(null);
+    try {
+      const updatedSnapshot = await updateReviewGroupCategory(
+        groupId,
+        approvedCategoryId,
+      );
+      setSnapshot(updatedSnapshot);
+      resetEditSelections();
+    } catch (categoryError) {
+      setActionError(
+        errorMessage(categoryError, "The approved category could not be updated."),
+      );
     } finally {
       setIsEditing(false);
     }
@@ -423,6 +453,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
               group={group}
               groups={snapshot.groups}
               groupIndex={groupIndex}
+              categories={categories}
               isEditing={isEditing}
               isReviewEditable={isReviewEditable}
               moveTargets={moveTargets}
@@ -438,6 +469,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
               onSplit={handleSplitGroup}
               onRestoreDuplicate={handleRestoreDuplicate}
               onSetCover={handleSetCover}
+              onUpdateCategory={handleUpdateCategory}
               onToggleImageSelection={toggleImageSelection}
               key={group.groupId}
             />
@@ -452,6 +484,7 @@ function ReviewGroupCard({
   group,
   groups,
   groupIndex,
+  categories,
   isEditing,
   isReviewEditable,
   moveTargets,
@@ -462,11 +495,13 @@ function ReviewGroupCard({
   onSplit,
   onRestoreDuplicate,
   onSetCover,
+  onUpdateCategory,
   onToggleImageSelection,
 }: {
   group: ReviewGroup;
   groups: ReviewGroup[];
   groupIndex: number;
+  categories: ReviewCategory[];
   isEditing: boolean;
   isReviewEditable: boolean;
   moveTargets: Record<string, string>;
@@ -481,6 +516,7 @@ function ReviewGroupCard({
   onSplit: (groupId: string, imageIds: string[]) => void;
   onRestoreDuplicate: (groupId: string, imageId: string) => void;
   onSetCover: (groupId: string, imageId: string) => void;
+  onUpdateCategory: (groupId: string, approvedCategoryId: string | null) => void;
   onToggleImageSelection: (imageId: string) => void;
 }) {
   const groupLabel = `Group ${groupIndex + 1}`;
@@ -511,9 +547,16 @@ function ReviewGroupCard({
           label="Suggested category"
           value={group.suggestedCategorySlug ?? "unknown"}
         />
-        <ReviewField
-          label="Approved category"
-          value={group.approvedCategorySlug ?? "not set"}
+        <ReviewCategoryField
+          approvedCategorySlug={group.approvedCategorySlug}
+          categories={categories}
+          groupLabel={groupLabel}
+          isEditing={isEditing}
+          isEditable={isGroupEditable}
+          onUpdateCategory={(approvedCategoryId) =>
+            onUpdateCategory(group.groupId, approvedCategoryId)
+          }
+          key={`${group.groupId}:${group.approvedCategorySlug ?? ""}`}
         />
         <ReviewField label="Confidence" value={formatConfidence(group.confidence)} />
         <ReviewField
@@ -578,6 +621,96 @@ function ReviewGroupCard({
         ))}
       </ul>
     </article>
+  );
+}
+
+function ReviewCategoryField({
+  approvedCategorySlug,
+  categories,
+  groupLabel,
+  isEditing,
+  isEditable,
+  onUpdateCategory,
+}: {
+  approvedCategorySlug: string | null;
+  categories: ReviewCategory[];
+  groupLabel: string;
+  isEditing: boolean;
+  isEditable: boolean;
+  onUpdateCategory: (approvedCategoryId: string | null) => void;
+}) {
+  const categoryById = new Map(
+    categories.map((category) => [category.id, category]),
+  );
+  const categoryBySlug = new Map(
+    categories.map((category) => [category.slug, category]),
+  );
+  const parentCategoryIds = new Set(
+    categories
+      .map((category) => category.parentId)
+      .filter((parentId): parentId is string => parentId !== null),
+  );
+  const currentCategoryId =
+    approvedCategorySlug !== null
+      ? categoryBySlug.get(approvedCategorySlug)?.id ?? ""
+      : "";
+  const [selectedCategoryId, setSelectedCategoryId] =
+    useState(currentCategoryId);
+
+  const isStaleApprovedCategory =
+    approvedCategorySlug !== null && currentCategoryId === "";
+  const hasChanged = selectedCategoryId !== currentCategoryId;
+
+  return (
+    <div>
+      <dt>Approved category</dt>
+      <dd className="category-control">
+        <select
+          aria-label={`Approved category for ${groupLabel}`}
+          value={selectedCategoryId}
+          disabled={!isEditable || isEditing}
+          onChange={(event) => setSelectedCategoryId(event.target.value)}
+        >
+          <option value="">No approved category</option>
+          {categories.map((category) => (
+            <option
+              key={category.id}
+              value={category.id}
+              disabled={parentCategoryIds.has(category.id)}
+            >
+              {categoryOptionLabel(category, categoryById)}
+            </option>
+          ))}
+        </select>
+        {isStaleApprovedCategory ? (
+          <span className="category-stale-note">
+            Current approved category is inactive or missing: {approvedCategorySlug}
+          </span>
+        ) : null}
+        {isEditable ? (
+          <div className="category-actions">
+            <button
+              type="button"
+              className="secondary-action"
+              aria-label={`Save category for ${groupLabel}`}
+              disabled={isEditing || !hasChanged}
+              onClick={() => onUpdateCategory(selectedCategoryId || null)}
+            >
+              Save category
+            </button>
+            <button
+              type="button"
+              className="secondary-action"
+              aria-label={`Clear category for ${groupLabel}`}
+              disabled={isEditing || approvedCategorySlug === null}
+              onClick={() => onUpdateCategory(null)}
+            >
+              Clear category
+            </button>
+          </div>
+        ) : null}
+      </dd>
+    </div>
   );
 }
 
@@ -746,6 +879,27 @@ function ReviewImageCard({
       ) : null}
     </li>
   );
+}
+
+function categoryOptionLabel(
+  category: ReviewCategory,
+  categoryById: Map<string, ReviewCategory>,
+): string {
+  let depth = 0;
+  let parentId = category.parentId;
+  const visitedCategoryIds = new Set<string>();
+
+  while (
+    parentId !== null &&
+    categoryById.has(parentId) &&
+    !visitedCategoryIds.has(parentId)
+  ) {
+    visitedCategoryIds.add(parentId);
+    depth += 1;
+    parentId = categoryById.get(parentId)?.parentId ?? null;
+  }
+
+  return `${"  ".repeat(depth)}${category.nameEn}`;
 }
 
 function ReviewField({ label, value }: { label: string; value: string }) {

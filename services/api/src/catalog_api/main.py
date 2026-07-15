@@ -9,6 +9,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -42,6 +43,7 @@ from catalog_api.local_batches import (
     LocalGroupNotFoundError,
     LocalImageNotFoundError,
 )
+from catalog_api.models import Category
 from catalog_api.processing_jobs import (
     ClassifyImageTaskPayload,
     GroupBatchTaskPayload,
@@ -317,6 +319,13 @@ class ReviewBatchGroupsResponse(ApiModel):
         serialization_alias="pipelineVersion",
     )
     groups: list[ReviewGroupResponse]
+
+
+class ReviewCategoryResponse(ApiModel):
+    id: UUID
+    slug: str
+    parent_id: UUID | None = Field(default=None, serialization_alias="parentId")
+    name_en: str = Field(serialization_alias="nameEn")
 
 
 class CreateReviewGroupRequest(ApiModel):
@@ -752,6 +761,36 @@ def _review_batch_groups_response(
     )
 
 
+def _active_global_categories(session: Session) -> list[Category]:
+    categories = session.scalars(
+        select(Category).where(
+            Category.organization_id.is_(None),
+            Category.active.is_(True),
+        )
+    ).all()
+    categories_by_id = {category.id: category for category in categories}
+    children_by_parent_id: dict[UUID | None, list[Category]] = {}
+
+    for category in categories:
+        parent_id = category.parent_id
+        if parent_id not in categories_by_id:
+            parent_id = None
+        children_by_parent_id.setdefault(parent_id, []).append(category)
+
+    for siblings in children_by_parent_id.values():
+        siblings.sort(key=lambda category: (category.name_en.casefold(), category.slug))
+
+    ordered_categories: list[Category] = []
+
+    def append_tree(parent_id: UUID | None) -> None:
+        for category in children_by_parent_id.get(parent_id, []):
+            ordered_categories.append(category)
+            append_tree(category.id)
+
+    append_tree(None)
+    return ordered_categories
+
+
 @app.post(
     "/v1/upload-batches",
     response_model=CreateUploadBatchResponse,
@@ -1003,6 +1042,30 @@ def get_durable_upload_batch_thumbnail(
         media_type="image/jpeg",
         headers=NO_STORE_HEADERS,
     )
+
+
+@app.get(
+    "/v1/categories",
+    response_model=list[ReviewCategoryResponse],
+)
+def list_review_categories(
+    session: Annotated[Session, Depends(get_session)],
+) -> list[ReviewCategoryResponse]:
+    try:
+        categories = _active_global_categories(session)
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error("Unable to load categories.") from error
+
+    return [
+        ReviewCategoryResponse(
+            id=category.id,
+            slug=category.slug,
+            parent_id=category.parent_id,
+            name_en=category.name_en,
+        )
+        for category in categories
+    ]
 
 
 @app.get(

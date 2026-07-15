@@ -244,6 +244,26 @@ async def test_patch_review_group_updates_cover_and_approved_category(
         ]
 
 
+async def test_patch_review_group_rejects_parent_category(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+) -> None:
+    with Session(migrated_engine) as session:
+        fixture = _create_review_edit_fixture(session)
+        parent_category_id = fixture.category_ids_by_slug["clothing"]
+
+    response = await database_client.patch(
+        f"/v1/groups/{fixture.group_ids[0]}",
+        json={"approvedCategoryId": str(parent_category_id)},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == {
+        "code": "invalid_review_edit",
+        "message": "approvedCategoryId must be a leaf category.",
+    }
+
+
 async def test_patch_review_group_image_marks_and_restores_duplicate(
     database_client: AsyncClient,
     migrated_engine: Engine,

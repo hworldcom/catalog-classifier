@@ -30,6 +30,13 @@ export type ReviewBatchGroups = {
   groups: ReviewGroup[];
 };
 
+export type ReviewCategory = {
+  id: string;
+  slug: string;
+  parentId: string | null;
+  nameEn: string;
+};
+
 type ApiErrorBody = {
   detail?: string | { message?: string };
 };
@@ -72,6 +79,19 @@ export async function loadReviewBatchGroups(
   }
 
   return (await response.json()) as ReviewBatchGroups;
+}
+
+export async function loadReviewCategories(
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<ReviewCategory[]> {
+  const response = await fetchImplementation(apiUrl("/v1/categories", baseUrl));
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as ReviewCategory[];
 }
 
 export async function createReviewGroup(
@@ -169,6 +189,25 @@ export async function updateReviewGroupCover(
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ coverImageId }),
+  });
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as ReviewBatchGroups;
+}
+
+export async function updateReviewGroupCategory(
+  groupId: string,
+  approvedCategoryId: string | null,
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<ReviewBatchGroups> {
+  const response = await fetchImplementation(apiUrl(`/v1/groups/${groupId}`, baseUrl), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ approvedCategoryId }),
   });
 
   if (!response.ok) {
