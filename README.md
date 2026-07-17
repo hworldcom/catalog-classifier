@@ -1029,8 +1029,11 @@ Groups that are already approved remain read-only even while the batch is still
 For `POST /v1/groups/{groupId}/split`, empty selections are invalid. Selecting
 images that already exactly match the current group membership is a no-op
 success. Selecting a single image is allowed and creates a singleton group.
+Group approval requires the batch to be `review_required`, the group to be
+`proposed`, and the group to have a non-null approved category.
 Batch approval only changes batch state; it does not mutate group memberships
-or duplicate flags.
+or duplicate flags. Batch approval requires all groups in the batch to already
+be approved.
 Every successful review mutation returns the updated review snapshot from
 `GET /v1/upload-batches/{batchId}/groups`.
 

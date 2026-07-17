@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   ReviewBatchError,
+  approveReviewBatch,
+  approveReviewGroup,
   createReviewGroup,
   loadReviewCategories,
   loadReviewBatchGroups,
@@ -104,6 +106,8 @@ describe("review batch client", () => {
       .mockResolvedValueOnce(jsonResponse(responseBody))
       .mockResolvedValueOnce(jsonResponse(responseBody))
       .mockResolvedValueOnce(jsonResponse(responseBody))
+      .mockResolvedValueOnce(jsonResponse(responseBody))
+      .mockResolvedValueOnce(jsonResponse(responseBody))
       .mockResolvedValueOnce(jsonResponse(responseBody));
 
     await expect(
@@ -168,6 +172,20 @@ describe("review batch client", () => {
         "group-1",
         "image-2",
         null,
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(responseBody);
+    await expect(
+      approveReviewGroup(
+        "group-1",
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(responseBody);
+    await expect(
+      approveReviewBatch(
+        "batch-1",
         fetchMock as typeof fetch,
         "http://api.example.test/",
       ),
@@ -252,6 +270,20 @@ describe("review batch client", () => {
           isDuplicate: false,
           duplicateOfImageId: null,
         }),
+      },
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      9,
+      "http://api.example.test/v1/groups/group-1/approve",
+      {
+        method: "POST",
+      },
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      10,
+      "http://api.example.test/v1/upload-batches/batch-1/approve",
+      {
+        method: "POST",
       },
     );
   });

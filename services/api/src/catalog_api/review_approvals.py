@@ -49,6 +49,10 @@ def approve_review_group(
         )
     if group.status != "proposed":
         raise ReviewApprovalStateError("Only proposed groups can be approved.")
+    if group.approved_category_id is None:
+        raise ReviewApprovalStateError(
+            "Group approval requires an approved category."
+        )
 
     group.status = "approved"
     group.approved_at = datetime.now(UTC)

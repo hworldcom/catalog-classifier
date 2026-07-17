@@ -7,6 +7,8 @@ import {
   ReviewCategory,
   ReviewGroup,
   ReviewGroupImage,
+  approveReviewBatch,
+  approveReviewGroup,
   createReviewGroup,
   loadReviewCategories,
   loadReviewBatchGroups,
@@ -109,6 +111,10 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
     .map((image) => image.imageId);
   const editableGroups = snapshot.groups.filter(
     (group) => group.status !== "approved",
+  );
+  const hasEditableGroups = editableGroups.length > 0;
+  const canApproveBatch = snapshot.groups.every(
+    (group) => group.status === "approved",
   );
   const selectedMergeSourceGroupIds = editableGroups
     .filter((group) => mergeSourceGroupIds.has(group.groupId))
@@ -323,6 +329,38 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
     }
   }
 
+  async function handleApproveGroup(groupId: string) {
+    setIsEditing(true);
+    setActionError(null);
+    try {
+      const updatedSnapshot = await approveReviewGroup(groupId);
+      setSnapshot(updatedSnapshot);
+      resetEditSelections();
+    } catch (approvalError) {
+      setActionError(errorMessage(approvalError, "The group could not be approved."));
+    } finally {
+      setIsEditing(false);
+    }
+  }
+
+  async function handleApproveBatch() {
+    if (!canApproveBatch) {
+      return;
+    }
+
+    setIsEditing(true);
+    setActionError(null);
+    try {
+      const updatedSnapshot = await approveReviewBatch(batchId);
+      setSnapshot(updatedSnapshot);
+      resetEditSelections();
+    } catch (approvalError) {
+      setActionError(errorMessage(approvalError, "The batch could not be approved."));
+    } finally {
+      setIsEditing(false);
+    }
+  }
+
   return (
     <main className="review-shell">
       <header className="review-header">
@@ -370,63 +408,85 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
 
       {isReviewEditable ? (
         <div className="review-edit-toolbars">
-          <section className="selection-toolbar" aria-label="Group creation">
-            <div>
-              <strong>{selectedEditableImageIds.length} selected</strong>
-              <span>Select one or more images to create a new group.</span>
-            </div>
-            <button
-              type="button"
-              disabled={isEditing || selectedEditableImageIds.length === 0}
-              onClick={handleCreateGroup}
-            >
-              {isEditing ? "Saving..." : "Create group"}
-            </button>
-          </section>
+          {hasEditableGroups ? (
+            <>
+              <section className="selection-toolbar" aria-label="Group creation">
+                <div>
+                  <strong>{selectedEditableImageIds.length} selected</strong>
+                  <span>Select one or more images to create a new group.</span>
+                </div>
+                <button
+                  type="button"
+                  disabled={isEditing || selectedEditableImageIds.length === 0}
+                  onClick={handleCreateGroup}
+                >
+                  {isEditing ? "Saving..." : "Create group"}
+                </button>
+              </section>
 
-          <section className="merge-toolbar" aria-label="Group merge">
+              <section className="merge-toolbar" aria-label="Group merge">
+                <div>
+                  <strong>Merge groups</strong>
+                  <span>Choose one target group and one or more source groups.</span>
+                </div>
+                <label>
+                  <span>Target group</span>
+                  <select
+                    aria-label="Merge target group"
+                    value={mergeTargetGroupId}
+                    disabled={isEditing || editableGroups.length === 0}
+                    onChange={(event) => handleMergeTargetChange(event.target.value)}
+                  >
+                    <option value="">Choose target</option>
+                    {editableGroups.map((group) => (
+                      <option key={group.groupId} value={group.groupId}>
+                        {reviewGroupLabel(snapshot.groups, group.groupId)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <fieldset>
+                  <legend>Source groups</legend>
+                  <div className="merge-source-list">
+                    {editableGroups.map((group) => (
+                      <label key={group.groupId}>
+                        <input
+                          type="checkbox"
+                          checked={mergeSourceGroupIds.has(group.groupId)}
+                          disabled={isEditing || group.groupId === mergeTargetGroupId}
+                          onChange={() => toggleMergeSourceGroup(group.groupId)}
+                        />
+                        <span>{reviewGroupLabel(snapshot.groups, group.groupId)}</span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+                <button
+                  type="button"
+                  disabled={isEditing || !canMergeGroups}
+                  onClick={handleMergeGroups}
+                >
+                  Merge
+                </button>
+              </section>
+            </>
+          ) : null}
+
+          <section className="approval-toolbar" aria-label="Batch approval">
             <div>
-              <strong>Merge groups</strong>
-              <span>Choose one target group and one or more source groups.</span>
+              <strong>Approve batch</strong>
+              <span>
+                {canApproveBatch
+                  ? "All groups are approved. The batch can now be frozen."
+                  : "Approve every group before approving the batch."}
+              </span>
             </div>
-            <label>
-              <span>Target group</span>
-              <select
-                aria-label="Merge target group"
-                value={mergeTargetGroupId}
-                disabled={isEditing || editableGroups.length === 0}
-                onChange={(event) => handleMergeTargetChange(event.target.value)}
-              >
-                <option value="">Choose target</option>
-                {editableGroups.map((group) => (
-                  <option key={group.groupId} value={group.groupId}>
-                    {reviewGroupLabel(snapshot.groups, group.groupId)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <fieldset>
-              <legend>Source groups</legend>
-              <div className="merge-source-list">
-                {editableGroups.map((group) => (
-                  <label key={group.groupId}>
-                    <input
-                      type="checkbox"
-                      checked={mergeSourceGroupIds.has(group.groupId)}
-                      disabled={isEditing || group.groupId === mergeTargetGroupId}
-                      onChange={() => toggleMergeSourceGroup(group.groupId)}
-                    />
-                    <span>{reviewGroupLabel(snapshot.groups, group.groupId)}</span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
             <button
               type="button"
-              disabled={isEditing || !canMergeGroups}
-              onClick={handleMergeGroups}
+              disabled={isEditing || !canApproveBatch}
+              onClick={handleApproveBatch}
             >
-              Merge
+              Approve batch
             </button>
           </section>
         </div>
@@ -466,6 +526,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
                 }))
               }
               onMarkDuplicate={handleMarkDuplicate}
+              onApproveGroup={handleApproveGroup}
               onSplit={handleSplitGroup}
               onRestoreDuplicate={handleRestoreDuplicate}
               onSetCover={handleSetCover}
@@ -492,6 +553,7 @@ function ReviewGroupCard({
   onMove,
   onMoveTargetChange,
   onMarkDuplicate,
+  onApproveGroup,
   onSplit,
   onRestoreDuplicate,
   onSetCover,
@@ -513,6 +575,7 @@ function ReviewGroupCard({
     imageId: string,
     duplicateOfImageId: string,
   ) => void;
+  onApproveGroup: (groupId: string) => void;
   onSplit: (groupId: string, imageIds: string[]) => void;
   onRestoreDuplicate: (groupId: string, imageId: string) => void;
   onSetCover: (groupId: string, imageId: string) => void;
@@ -528,6 +591,7 @@ function ReviewGroupCard({
   const selectedGroupImageIds = group.images
     .filter((image) => selectedImageIds.has(image.imageId))
     .map((image) => image.imageId);
+  const canApproveGroup = group.approvedCategorySlug !== null;
 
   return (
     <article className="group-card">
@@ -575,20 +639,36 @@ function ReviewGroupCard({
 
       {isGroupEditable ? (
         <div className="group-edit-actions">
-          <span>
-            {selectedGroupImageIds.length} selected in {groupLabel}
-          </span>
-          <button
-            type="button"
-            disabled={
-              isEditing ||
-              selectedGroupImageIds.length === 0 ||
-              selectedGroupImageIds.length >= group.images.length
-            }
-            onClick={() => onSplit(group.groupId, selectedGroupImageIds)}
-          >
-            Split into new group
-          </button>
+          <div className="group-edit-action-block">
+            <span>
+              {selectedGroupImageIds.length} selected in {groupLabel}
+            </span>
+            <button
+              type="button"
+              disabled={
+                isEditing ||
+                selectedGroupImageIds.length === 0 ||
+                selectedGroupImageIds.length >= group.images.length
+              }
+              onClick={() => onSplit(group.groupId, selectedGroupImageIds)}
+            >
+              Split into new group
+            </button>
+          </div>
+          <div className="group-edit-action-block">
+            <span>
+              {canApproveGroup
+                ? "This group is ready for approval."
+                : "Select an approved category before approving this group."}
+            </span>
+            <button
+              type="button"
+              disabled={isEditing || !canApproveGroup}
+              onClick={() => onApproveGroup(group.groupId)}
+            >
+              Approve group
+            </button>
+          </div>
         </div>
       ) : null}
 

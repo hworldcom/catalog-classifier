@@ -51,7 +51,7 @@ async def test_approve_review_group_logs_event_and_is_idempotent(
     assert response.status_code == 200
     group = _group_by_id(response.json(), fixture.group_ids[0])
     assert group["status"] == "approved"
-    assert group["approvedCategorySlug"] is None
+    assert group["approvedCategorySlug"] == "t-shirts"
     with Session(migrated_engine) as session:
         stored_group = session.get(ProductGroup, fixture.group_ids[0])
         assert stored_group is not None
@@ -141,6 +141,34 @@ async def test_approve_review_batch_requires_approved_groups_then_locks_batch(
         assert _review_event_count(session, fixture.batch_id) == first_event_count
 
 
+async def test_approve_review_group_requires_approved_category(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+) -> None:
+    with Session(migrated_engine) as session:
+        fixture = _create_review_approval_fixture(
+            session,
+            group_count=1,
+            has_approved_category=False,
+        )
+
+    response = await database_client.post(
+        f"/v1/groups/{fixture.group_ids[0]}/approve",
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "review_approval_not_allowed",
+        "message": "Group approval requires an approved category.",
+    }
+    with Session(migrated_engine) as session:
+        stored_group = session.get(ProductGroup, fixture.group_ids[0])
+        assert stored_group is not None
+        assert stored_group.status == "proposed"
+        assert stored_group.approved_at is None
+        assert _review_event_count(session, fixture.batch_id) == 0
+
+
 async def test_approve_review_batch_allows_empty_review_batch(
     database_client: AsyncClient,
     migrated_engine: Engine,
@@ -196,6 +224,7 @@ def _create_review_approval_fixture(
     *,
     group_count: int,
     status: str = "review_required",
+    has_approved_category: bool = True,
 ) -> ReviewApprovalFixture:
     category = session.scalar(select(Category).where(Category.slug == "t-shirts"))
     assert category is not None
@@ -241,6 +270,7 @@ def _create_review_approval_fixture(
             batch_id=batch.id,
             status="proposed",
             suggested_category_id=category.id,
+            approved_category_id=category.id if has_approved_category else None,
             cover_image_id=image_id,
             confidence=1.0,
         )

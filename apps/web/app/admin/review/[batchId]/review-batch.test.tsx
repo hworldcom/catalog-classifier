@@ -6,6 +6,8 @@ import ReviewBatch from "@/app/admin/review/[batchId]/review-batch";
 import {
   ReviewBatchGroups,
   ReviewCategory,
+  approveReviewBatch,
+  approveReviewGroup,
   createReviewGroup,
   loadReviewCategories,
   loadReviewBatchGroups,
@@ -19,6 +21,8 @@ import {
 } from "@/lib/review-batches";
 
 vi.mock("@/lib/review-batches", () => ({
+  approveReviewBatch: vi.fn(),
+  approveReviewGroup: vi.fn(),
   createReviewGroup: vi.fn(),
   loadReviewCategories: vi.fn(),
   loadReviewBatchGroups: vi.fn(),
@@ -31,6 +35,8 @@ vi.mock("@/lib/review-batches", () => ({
   updateReviewImageDuplicate: vi.fn(),
 }));
 
+const approveReviewBatchMock = vi.mocked(approveReviewBatch);
+const approveReviewGroupMock = vi.mocked(approveReviewGroup);
 const createReviewGroupMock = vi.mocked(createReviewGroup);
 const loadReviewCategoriesMock = vi.mocked(loadReviewCategories);
 const loadReviewBatchGroupsMock = vi.mocked(loadReviewBatchGroups);
@@ -131,6 +137,8 @@ const reviewSnapshot: ReviewBatchGroups = {
 
 describe("ReviewBatch", () => {
   beforeEach(() => {
+    approveReviewBatchMock.mockReset();
+    approveReviewGroupMock.mockReset();
     createReviewGroupMock.mockReset();
     loadReviewCategoriesMock.mockReset();
     loadReviewBatchGroupsMock.mockReset();
@@ -173,6 +181,15 @@ describe("ReviewBatch", () => {
       screen.getByText("Possible variant of an existing item."),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create group" })).toBeDisabled();
+    expect(screen.getAllByRole("button", { name: "Approve group" })[0]).toBeDisabled();
+    expect(screen.getAllByRole("button", { name: "Approve group" })[1]).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Approve batch" })).toBeDisabled();
+    expect(
+      screen.getByText("Select an approved category before approving this group."),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Approve every group before approving the batch."),
+    ).toBeInTheDocument();
     expect(screen.getByLabelText("Select front.jpg")).toBeInTheDocument();
     expect(screen.getByLabelText("Select front-copy.jpg")).toBeInTheDocument();
     expect(screen.getByLabelText("Select back.jpg")).toBeInTheDocument();
@@ -467,6 +484,73 @@ describe("ReviewBatch", () => {
     expect(updateReviewGroupCategoryMock).toHaveBeenCalledWith("group-2", null);
   });
 
+  it("approves a group with an approved category", async () => {
+    const user = userEvent.setup();
+    const approvableSnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: [
+        {
+          ...reviewSnapshot.groups[0],
+          approvedCategorySlug: "t-shirts",
+        },
+        reviewSnapshot.groups[1],
+      ],
+    };
+    const approvedGroupSnapshot: ReviewBatchGroups = {
+      ...approvableSnapshot,
+      groups: [
+        {
+          ...approvableSnapshot.groups[0],
+          status: "approved",
+        },
+        approvableSnapshot.groups[1],
+      ],
+    };
+    loadReviewBatchGroupsMock.mockResolvedValue(approvableSnapshot);
+    approveReviewGroupMock.mockResolvedValue(approvedGroupSnapshot);
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    const approveGroupButtons = await screen.findAllByRole("button", {
+      name: "Approve group",
+    });
+    await user.click(approveGroupButtons[0]);
+
+    expect(approveReviewGroupMock).toHaveBeenCalledWith("group-1");
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Select front.jpg")).not.toBeInTheDocument();
+    });
+    expect(screen.getByLabelText("Select back.jpg")).toBeInTheDocument();
+  });
+
+  it("approves a batch after every group is approved", async () => {
+    const user = userEvent.setup();
+    const readySnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: reviewSnapshot.groups.map((group) => ({
+        ...group,
+        status: "approved",
+        approvedCategorySlug: group.approvedCategorySlug ?? "t-shirts",
+      })),
+    };
+    const approvedBatchSnapshot: ReviewBatchGroups = {
+      ...readySnapshot,
+      status: "approved",
+    };
+    loadReviewBatchGroupsMock.mockResolvedValue(readySnapshot);
+    approveReviewBatchMock.mockResolvedValue(approvedBatchSnapshot);
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    await user.click(await screen.findByRole("button", { name: "Approve batch" }));
+
+    expect(approveReviewBatchMock).toHaveBeenCalledWith("batch-1");
+    expect(
+      await screen.findByText("This batch is approved and read-only."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
   it("marks a non-duplicate image as duplicate of another group image", async () => {
     const user = userEvent.setup();
     const markedSnapshot: ReviewBatchGroups = {
@@ -666,6 +750,34 @@ describe("ReviewBatch", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "approvedCategoryId must be a leaf category.",
+    );
+  });
+
+  it("shows action errors from failed approval", async () => {
+    const user = userEvent.setup();
+    loadReviewBatchGroupsMock.mockResolvedValue({
+      ...reviewSnapshot,
+      groups: [
+        {
+          ...reviewSnapshot.groups[0],
+          approvedCategorySlug: "t-shirts",
+        },
+        reviewSnapshot.groups[1],
+      ],
+    });
+    approveReviewGroupMock.mockRejectedValue(
+      new Error("Group approval requires an approved category."),
+    );
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    const approveGroupButtons = await screen.findAllByRole("button", {
+      name: "Approve group",
+    });
+    await user.click(approveGroupButtons[0]);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Group approval requires an approved category.",
     );
   });
 

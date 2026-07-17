@@ -243,6 +243,44 @@ export async function updateReviewImageDuplicate(
   return (await response.json()) as ReviewBatchGroups;
 }
 
+export async function approveReviewGroup(
+  groupId: string,
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<ReviewBatchGroups> {
+  const response = await fetchImplementation(
+    apiUrl(`/v1/groups/${groupId}/approve`, baseUrl),
+    {
+      method: "POST",
+    },
+  );
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as ReviewBatchGroups;
+}
+
+export async function approveReviewBatch(
+  batchId: string,
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<ReviewBatchGroups> {
+  const response = await fetchImplementation(
+    apiUrl(`/v1/upload-batches/${batchId}/approve`, baseUrl),
+    {
+      method: "POST",
+    },
+  );
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as ReviewBatchGroups;
+}
+
 export function reviewBatchAssetUrl(
   path: string,
   baseUrl = apiBaseUrl(),

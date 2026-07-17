@@ -410,6 +410,32 @@ button.secondary-action:hover:not(:disabled) {
   padding-inline: 1rem;
 }
 
+.approval-toolbar {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--card);
+}
+
+.approval-toolbar div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.approval-toolbar span {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.approval-toolbar button {
+  min-width: 8rem;
+  padding-inline: 1rem;
+}
+
 .review-action-error {
   margin: 0 0 1.5rem;
 }
@@ -589,6 +615,11 @@ button.secondary-action:hover:not(:disabled) {
 .group-edit-actions button {
   min-height: 2.5rem;
   padding-inline: 0.9rem;
+}
+
+.group-edit-action-block {
+  display: grid;
+  gap: 0.5rem;
 }
 
 .image-grid {
@@ -851,6 +882,10 @@ button.secondary-action:hover:not(:disabled) {
   }
 
   .group-edit-actions {
+    display: grid;
+  }
+
+  .approval-toolbar {
     display: grid;
   }
 
