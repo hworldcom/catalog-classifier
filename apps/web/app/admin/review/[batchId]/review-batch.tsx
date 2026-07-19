@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
+  ReviewBatchError,
   ReviewBatchGroups,
   ReviewCategory,
   ReviewGroup,
@@ -14,7 +15,10 @@ import {
   loadReviewBatchGroups,
   mergeReviewGroups,
   moveReviewImage,
+  rejectReviewImage,
   reviewBatchAssetUrl,
+  restoreReviewImageRejection,
+  runMultimodalComparison,
   splitReviewGroup,
   updateReviewGroupCategory,
   updateReviewGroupCover,
@@ -25,12 +29,31 @@ type ReviewBatchProps = {
   batchId: string;
 };
 
+type PendingImageRejection = {
+  groupId: string;
+  imageId: string;
+  originalFilename: string;
+};
+
+const CATEGORY_SUGGESTION_POLL_INTERVAL_MS = 2_000;
+
 export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   const [snapshot, setSnapshot] = useState<ReviewBatchGroups | null>(null);
   const [categories, setCategories] = useState<ReviewCategory[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  const [suggestionPollingError, setSuggestionPollingError] =
+    useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
+  const [isComparisonRunning, setIsComparisonRunning] = useState(false);
+  const [isComparisonDialogOpen, setIsComparisonDialogOpen] = useState(false);
+  const [pendingImageRejection, setPendingImageRejection] =
+    useState<PendingImageRejection | null>(null);
+  const [hasLocalReviewActivity, setHasLocalReviewActivity] = useState(false);
+  const [transientStateVersion, setTransientStateVersion] = useState(0);
+  const comparisonActionRef = useRef<HTMLButtonElement>(null);
+  const rejectionActionRef = useRef<HTMLButtonElement | null>(null);
   const [selectedImageIds, setSelectedImageIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -39,6 +62,14 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   const [mergeSourceGroupIds, setMergeSourceGroupIds] = useState<Set<string>>(
     () => new Set(),
   );
+  const isBusy = isEditing || isComparisonRunning;
+  const shouldPollCategorySuggestions =
+    snapshot?.status === "review_required" &&
+    snapshot.groups.some(
+      (group) =>
+        group.status === "proposed" &&
+        group.categorySuggestionStatus === "pending",
+    );
 
   useEffect(() => {
     let isCurrent = true;
@@ -70,6 +101,52 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
       isCurrent = false;
     };
   }, [batchId]);
+
+  useEffect(() => {
+    if (!shouldPollCategorySuggestions || isBusy) {
+      return;
+    }
+
+    let isCurrent = true;
+    let timeoutId: number | undefined;
+
+    async function pollCategorySuggestions() {
+      try {
+        const updatedSnapshot = await loadReviewBatchGroups(batchId);
+        if (isCurrent) {
+          setSnapshot(updatedSnapshot);
+          setSuggestionPollingError(null);
+        }
+      } catch (pollError) {
+        if (isCurrent) {
+          setSuggestionPollingError(
+            errorMessage(
+              pollError,
+              "Category suggestions could not be refreshed.",
+            ),
+          );
+        }
+      } finally {
+        if (isCurrent) {
+          timeoutId = window.setTimeout(
+            pollCategorySuggestions,
+            CATEGORY_SUGGESTION_POLL_INTERVAL_MS,
+          );
+        }
+      }
+    }
+
+    timeoutId = window.setTimeout(
+      pollCategorySuggestions,
+      CATEGORY_SUGGESTION_POLL_INTERVAL_MS,
+    );
+    return () => {
+      isCurrent = false;
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [batchId, isBusy, shouldPollCategorySuggestions]);
 
   if (error) {
     return (
@@ -106,6 +183,13 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   );
   const isApprovedBatch = snapshot.status === "approved";
   const isReviewEditable = snapshot.status === "review_required";
+  const hasApprovedGroup = snapshot.groups.some(
+    (group) => group.status === "approved",
+  );
+  const isComparisonUnavailable =
+    hasApprovedGroup || hasLocalReviewActivity;
+  const isComparisonDisabled =
+    isBusy || isComparisonUnavailable;
   const selectedEditableImageIds = orderedEditableImages(snapshot)
     .filter((image) => selectedImageIds.has(image.imageId))
     .map((image) => image.imageId);
@@ -122,11 +206,30 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   const canMergeGroups =
     Boolean(mergeTargetGroupId) && selectedMergeSourceGroupIds.length > 0;
 
-  function resetEditSelections() {
+  function resetTransientEditState() {
     setSelectedImageIds(new Set());
     setMoveTargets({});
     setMergeTargetGroupId("");
     setMergeSourceGroupIds(new Set());
+    setTransientStateVersion((current) => current + 1);
+  }
+
+  function beginReviewMutation(): boolean {
+    if (isBusy) {
+      return false;
+    }
+
+    setIsEditing(true);
+    setActionError(null);
+    setActionSuccess(null);
+    return true;
+  }
+
+  function applyReviewMutationSnapshot(updatedSnapshot: ReviewBatchGroups) {
+    setSnapshot(updatedSnapshot);
+    setSuggestionPollingError(null);
+    setHasLocalReviewActivity(true);
+    resetTransientEditState();
   }
 
   function toggleImageSelection(imageId: string) {
@@ -167,19 +270,16 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   }
 
   async function handleCreateGroup() {
-    if (selectedEditableImageIds.length === 0) {
+    if (selectedEditableImageIds.length === 0 || !beginReviewMutation()) {
       return;
     }
 
-    setIsEditing(true);
-    setActionError(null);
     try {
       const updatedSnapshot = await createReviewGroup(
         batchId,
         selectedEditableImageIds,
       );
-      setSnapshot(updatedSnapshot);
-      resetEditSelections();
+      applyReviewMutationSnapshot(updatedSnapshot);
     } catch (createError) {
       setActionError(errorMessage(createError, "The group could not be created."));
     } finally {
@@ -189,16 +289,13 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
 
   async function handleMove(imageId: string) {
     const targetGroupId = moveTargets[imageId];
-    if (!targetGroupId) {
+    if (!targetGroupId || !beginReviewMutation()) {
       return;
     }
 
-    setIsEditing(true);
-    setActionError(null);
     try {
       const updatedSnapshot = await moveReviewImage(targetGroupId, imageId);
-      setSnapshot(updatedSnapshot);
-      resetEditSelections();
+      applyReviewMutationSnapshot(updatedSnapshot);
     } catch (moveError) {
       setActionError(errorMessage(moveError, "The image could not be moved."));
     } finally {
@@ -207,19 +304,16 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   }
 
   async function handleMergeGroups() {
-    if (!canMergeGroups) {
+    if (!canMergeGroups || !beginReviewMutation()) {
       return;
     }
 
-    setIsEditing(true);
-    setActionError(null);
     try {
       const updatedSnapshot = await mergeReviewGroups(
         mergeTargetGroupId,
         selectedMergeSourceGroupIds,
       );
-      setSnapshot(updatedSnapshot);
-      resetEditSelections();
+      applyReviewMutationSnapshot(updatedSnapshot);
     } catch (mergeError) {
       setActionError(errorMessage(mergeError, "The groups could not be merged."));
     } finally {
@@ -228,16 +322,13 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   }
 
   async function handleSplitGroup(groupId: string, imageIds: string[]) {
-    if (imageIds.length === 0) {
+    if (imageIds.length === 0 || !beginReviewMutation()) {
       return;
     }
 
-    setIsEditing(true);
-    setActionError(null);
     try {
       const updatedSnapshot = await splitReviewGroup(groupId, imageIds);
-      setSnapshot(updatedSnapshot);
-      resetEditSelections();
+      applyReviewMutationSnapshot(updatedSnapshot);
     } catch (splitError) {
       setActionError(errorMessage(splitError, "The group could not be split."));
     } finally {
@@ -246,12 +337,13 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   }
 
   async function handleSetCover(groupId: string, imageId: string) {
-    setIsEditing(true);
-    setActionError(null);
+    if (!beginReviewMutation()) {
+      return;
+    }
+
     try {
       const updatedSnapshot = await updateReviewGroupCover(groupId, imageId);
-      setSnapshot(updatedSnapshot);
-      resetEditSelections();
+      applyReviewMutationSnapshot(updatedSnapshot);
     } catch (coverError) {
       setActionError(errorMessage(coverError, "The cover image could not be updated."));
     } finally {
@@ -263,15 +355,16 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
     groupId: string,
     approvedCategoryId: string | null,
   ) {
-    setIsEditing(true);
-    setActionError(null);
+    if (!beginReviewMutation()) {
+      return;
+    }
+
     try {
       const updatedSnapshot = await updateReviewGroupCategory(
         groupId,
         approvedCategoryId,
       );
-      setSnapshot(updatedSnapshot);
-      resetEditSelections();
+      applyReviewMutationSnapshot(updatedSnapshot);
     } catch (categoryError) {
       setActionError(
         errorMessage(categoryError, "The approved category could not be updated."),
@@ -286,20 +379,17 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
     imageId: string,
     duplicateOfImageId: string,
   ) {
-    if (!duplicateOfImageId) {
+    if (!duplicateOfImageId || !beginReviewMutation()) {
       return;
     }
 
-    setIsEditing(true);
-    setActionError(null);
     try {
       const updatedSnapshot = await updateReviewImageDuplicate(
         groupId,
         imageId,
         duplicateOfImageId,
       );
-      setSnapshot(updatedSnapshot);
-      resetEditSelections();
+      applyReviewMutationSnapshot(updatedSnapshot);
     } catch (duplicateError) {
       setActionError(
         errorMessage(duplicateError, "The duplicate state could not be updated."),
@@ -310,16 +400,17 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   }
 
   async function handleRestoreDuplicate(groupId: string, imageId: string) {
-    setIsEditing(true);
-    setActionError(null);
+    if (!beginReviewMutation()) {
+      return;
+    }
+
     try {
       const updatedSnapshot = await updateReviewImageDuplicate(
         groupId,
         imageId,
         null,
       );
-      setSnapshot(updatedSnapshot);
-      resetEditSelections();
+      applyReviewMutationSnapshot(updatedSnapshot);
     } catch (duplicateError) {
       setActionError(
         errorMessage(duplicateError, "The duplicate state could not be updated."),
@@ -329,13 +420,97 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
     }
   }
 
-  async function handleApproveGroup(groupId: string) {
-    setIsEditing(true);
+  function restoreRejectionActionFocus() {
+    window.setTimeout(() => {
+      rejectionActionRef.current?.focus();
+    }, 0);
+  }
+
+  function handleOpenRejectionDialog(
+    groupId: string,
+    imageId: string,
+    originalFilename: string,
+    trigger: HTMLButtonElement,
+  ) {
+    if (isBusy) {
+      return;
+    }
+
+    rejectionActionRef.current = trigger;
     setActionError(null);
+    setActionSuccess(null);
+    setPendingImageRejection({
+      groupId,
+      imageId,
+      originalFilename,
+    });
+  }
+
+  function handleCancelRejection() {
+    setPendingImageRejection(null);
+    restoreRejectionActionFocus();
+  }
+
+  async function handleRejectImage() {
+    const pendingRejection = pendingImageRejection;
+    if (!pendingRejection || !beginReviewMutation()) {
+      return;
+    }
+
+    setPendingImageRejection(null);
+    try {
+      const updatedSnapshot = await rejectReviewImage(
+        pendingRejection.groupId,
+        pendingRejection.imageId,
+      );
+      applyReviewMutationSnapshot(updatedSnapshot);
+    } catch (rejectionError) {
+      setActionError(
+        errorMessage(
+          rejectionError,
+          "The image could not be excluded from export.",
+        ),
+      );
+    } finally {
+      setIsEditing(false);
+      restoreRejectionActionFocus();
+    }
+  }
+
+  async function handleRestoreImageRejection(
+    groupId: string,
+    imageId: string,
+  ) {
+    if (!beginReviewMutation()) {
+      return;
+    }
+
+    try {
+      const updatedSnapshot = await restoreReviewImageRejection(
+        groupId,
+        imageId,
+      );
+      applyReviewMutationSnapshot(updatedSnapshot);
+    } catch (rejectionError) {
+      setActionError(
+        errorMessage(
+          rejectionError,
+          "The image could not be restored for export.",
+        ),
+      );
+    } finally {
+      setIsEditing(false);
+    }
+  }
+
+  async function handleApproveGroup(groupId: string) {
+    if (!beginReviewMutation()) {
+      return;
+    }
+
     try {
       const updatedSnapshot = await approveReviewGroup(groupId);
-      setSnapshot(updatedSnapshot);
-      resetEditSelections();
+      applyReviewMutationSnapshot(updatedSnapshot);
     } catch (approvalError) {
       setActionError(errorMessage(approvalError, "The group could not be approved."));
     } finally {
@@ -344,20 +519,82 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
   }
 
   async function handleApproveBatch() {
-    if (!canApproveBatch) {
+    if (!canApproveBatch || !beginReviewMutation()) {
       return;
     }
 
-    setIsEditing(true);
-    setActionError(null);
     try {
       const updatedSnapshot = await approveReviewBatch(batchId);
-      setSnapshot(updatedSnapshot);
-      resetEditSelections();
+      applyReviewMutationSnapshot(updatedSnapshot);
     } catch (approvalError) {
       setActionError(errorMessage(approvalError, "The batch could not be approved."));
     } finally {
       setIsEditing(false);
+    }
+  }
+
+  function restoreComparisonActionFocus() {
+    window.setTimeout(() => {
+      comparisonActionRef.current?.focus();
+    }, 0);
+  }
+
+  function handleOpenComparisonDialog() {
+    if (isComparisonDisabled) {
+      return;
+    }
+
+    setActionError(null);
+    setActionSuccess(null);
+    setIsComparisonDialogOpen(true);
+  }
+
+  function handleCancelComparison() {
+    setIsComparisonDialogOpen(false);
+    restoreComparisonActionFocus();
+  }
+
+  async function handleRunComparison() {
+    if (isBusy) {
+      return;
+    }
+
+    setIsComparisonDialogOpen(false);
+    setIsComparisonRunning(true);
+    setActionError(null);
+    setActionSuccess(null);
+
+    try {
+      const updatedSnapshot = await runMultimodalComparison(batchId);
+      setSnapshot(updatedSnapshot);
+      resetTransientEditState();
+      setActionSuccess(
+        "Multimodal comparison completed. Review groups were refreshed.",
+      );
+    } catch (comparisonError) {
+      const message = errorMessage(
+        comparisonError,
+        "Multimodal comparison could not be completed.",
+      );
+      setActionError(message);
+
+      if (
+        comparisonError instanceof ReviewBatchError &&
+        comparisonError.status === 409 &&
+        comparisonError.code === "multimodal_comparison_not_allowed"
+      ) {
+        setHasLocalReviewActivity(true);
+        try {
+          const refreshedSnapshot = await loadReviewBatchGroups(batchId);
+          setSnapshot(refreshedSnapshot);
+          resetTransientEditState();
+        } catch {
+          // Keep the original comparison error and current snapshot.
+        }
+      }
+    } finally {
+      setIsComparisonRunning(false);
+      restoreComparisonActionFocus();
     }
   }
 
@@ -407,6 +644,39 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
       ) : null}
 
       {isReviewEditable ? (
+        <section
+          className="comparison-toolbar"
+          aria-label="Multimodal comparison"
+        >
+          <div>
+            <strong>Optional multimodal comparison</strong>
+            <span>
+              {hasApprovedGroup || hasLocalReviewActivity
+                ? "Multimodal comparison must run before manual review changes."
+                : "Refine eligible uncertain pairs before manual review. Gemini usage may incur costs."}
+            </span>
+          </div>
+          <button
+            type="button"
+            aria-disabled={isComparisonUnavailable}
+            disabled={isBusy}
+            onClick={handleOpenComparisonDialog}
+            ref={comparisonActionRef}
+          >
+            {isComparisonRunning
+              ? "Running multimodal comparison..."
+              : "Run multimodal comparison"}
+          </button>
+        </section>
+      ) : null}
+
+      {isComparisonRunning ? (
+        <div className="message uploading review-comparison-progress" role="status">
+          Multimodal comparison is running. This may take several minutes.
+        </div>
+      ) : null}
+
+      {isReviewEditable ? (
         <div className="review-edit-toolbars">
           {hasEditableGroups ? (
             <>
@@ -417,7 +687,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
                 </div>
                 <button
                   type="button"
-                  disabled={isEditing || selectedEditableImageIds.length === 0}
+                  disabled={isBusy || selectedEditableImageIds.length === 0}
                   onClick={handleCreateGroup}
                 >
                   {isEditing ? "Saving..." : "Create group"}
@@ -434,7 +704,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
                   <select
                     aria-label="Merge target group"
                     value={mergeTargetGroupId}
-                    disabled={isEditing || editableGroups.length === 0}
+                    disabled={isBusy || editableGroups.length === 0}
                     onChange={(event) => handleMergeTargetChange(event.target.value)}
                   >
                     <option value="">Choose target</option>
@@ -453,7 +723,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
                         <input
                           type="checkbox"
                           checked={mergeSourceGroupIds.has(group.groupId)}
-                          disabled={isEditing || group.groupId === mergeTargetGroupId}
+                          disabled={isBusy || group.groupId === mergeTargetGroupId}
                           onChange={() => toggleMergeSourceGroup(group.groupId)}
                         />
                         <span>{reviewGroupLabel(snapshot.groups, group.groupId)}</span>
@@ -463,7 +733,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
                 </fieldset>
                 <button
                   type="button"
-                  disabled={isEditing || !canMergeGroups}
+                  disabled={isBusy || !canMergeGroups}
                   onClick={handleMergeGroups}
                 >
                   Merge
@@ -483,7 +753,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
             </div>
             <button
               type="button"
-              disabled={isEditing || !canApproveBatch}
+              disabled={isBusy || !canApproveBatch}
               onClick={handleApproveBatch}
             >
               Approve batch
@@ -495,6 +765,18 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
       {actionError ? (
         <div className="message error review-action-error" role="alert">
           {actionError}
+        </div>
+      ) : null}
+
+      {suggestionPollingError ? (
+        <div className="message error review-action-error" role="alert">
+          {suggestionPollingError}
+        </div>
+      ) : null}
+
+      {actionSuccess ? (
+        <div className="message completed review-action-success" role="status">
+          {actionSuccess}
         </div>
       ) : null}
 
@@ -514,7 +796,7 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
               groups={snapshot.groups}
               groupIndex={groupIndex}
               categories={categories}
-              isEditing={isEditing}
+              isBusy={isBusy}
               isReviewEditable={isReviewEditable}
               moveTargets={moveTargets}
               selectedImageIds={selectedImageIds}
@@ -527,17 +809,218 @@ export default function ReviewBatch({ batchId }: ReviewBatchProps) {
               }
               onMarkDuplicate={handleMarkDuplicate}
               onApproveGroup={handleApproveGroup}
+              onRequestRejection={handleOpenRejectionDialog}
+              onRestoreRejection={handleRestoreImageRejection}
               onSplit={handleSplitGroup}
               onRestoreDuplicate={handleRestoreDuplicate}
               onSetCover={handleSetCover}
               onUpdateCategory={handleUpdateCategory}
               onToggleImageSelection={toggleImageSelection}
-              key={group.groupId}
+              key={`${group.groupId}:${transientStateVersion}`}
             />
           ))}
         </section>
       )}
+
+      {isComparisonDialogOpen ? (
+        <ComparisonConfirmationDialog
+          isBusy={isBusy}
+          onCancel={handleCancelComparison}
+          onConfirm={handleRunComparison}
+        />
+      ) : null}
+
+      {pendingImageRejection ? (
+        <RejectionConfirmationDialog
+          imageFilename={pendingImageRejection.originalFilename}
+          isBusy={isBusy}
+          onCancel={handleCancelRejection}
+          onConfirm={handleRejectImage}
+        />
+      ) : null}
     </main>
+  );
+}
+
+function ComparisonConfirmationDialog({
+  isBusy,
+  onCancel,
+  onConfirm,
+}: {
+  isBusy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    cancelButtonRef.current?.focus();
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape" && !isBusy) {
+        event.preventDefault();
+        onCancel();
+        return;
+      }
+      if (event.key !== "Tab") {
+        return;
+      }
+
+      const focusableButtons = Array.from(
+        dialogRef.current?.querySelectorAll<HTMLButtonElement>(
+          "button:not(:disabled)",
+        ) ?? [],
+      );
+      if (focusableButtons.length === 0) {
+        event.preventDefault();
+        return;
+      }
+
+      const firstButton = focusableButtons[0];
+      const lastButton = focusableButtons[focusableButtons.length - 1];
+      if (event.shiftKey && document.activeElement === firstButton) {
+        event.preventDefault();
+        lastButton.focus();
+      } else if (!event.shiftKey && document.activeElement === lastButton) {
+        event.preventDefault();
+        firstButton.focus();
+      } else if (!dialogRef.current?.contains(document.activeElement)) {
+        event.preventDefault();
+        firstButton.focus();
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isBusy, onCancel]);
+
+  return (
+    <div className="comparison-dialog-backdrop">
+      <div
+        aria-describedby="comparison-dialog-description"
+        aria-labelledby="comparison-dialog-title"
+        aria-modal="true"
+        className="comparison-dialog"
+        ref={dialogRef}
+        role="dialog"
+      >
+        <h2 id="comparison-dialog-title">Run multimodal comparison?</h2>
+        <p id="comparison-dialog-description">
+          This optional step sends eligible uncertain image pairs to Google Gemini
+          and may incur usage costs. It may take several minutes and must run before
+          manual review changes.
+        </p>
+        <div className="comparison-dialog-actions">
+          <button
+            type="button"
+            className="secondary-action"
+            disabled={isBusy}
+            onClick={onCancel}
+            ref={cancelButtonRef}
+          >
+            Cancel
+          </button>
+          <button type="button" disabled={isBusy} onClick={onConfirm}>
+            Run comparison
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RejectionConfirmationDialog({
+  imageFilename,
+  isBusy,
+  onCancel,
+  onConfirm,
+}: {
+  imageFilename: string;
+  isBusy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    cancelButtonRef.current?.focus();
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape" && !isBusy) {
+        event.preventDefault();
+        onCancel();
+        return;
+      }
+      if (event.key !== "Tab") {
+        return;
+      }
+
+      const focusableButtons = Array.from(
+        dialogRef.current?.querySelectorAll<HTMLButtonElement>(
+          "button:not(:disabled)",
+        ) ?? [],
+      );
+      if (focusableButtons.length === 0) {
+        event.preventDefault();
+        return;
+      }
+
+      const firstButton = focusableButtons[0];
+      const lastButton = focusableButtons[focusableButtons.length - 1];
+      if (event.shiftKey && document.activeElement === firstButton) {
+        event.preventDefault();
+        lastButton.focus();
+      } else if (!event.shiftKey && document.activeElement === lastButton) {
+        event.preventDefault();
+        firstButton.focus();
+      } else if (!dialogRef.current?.contains(document.activeElement)) {
+        event.preventDefault();
+        firstButton.focus();
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isBusy, onCancel]);
+
+  return (
+    <div className="comparison-dialog-backdrop">
+      <div
+        aria-describedby="rejection-dialog-description"
+        aria-labelledby="rejection-dialog-title"
+        aria-modal="true"
+        className="comparison-dialog"
+        ref={dialogRef}
+        role="dialog"
+      >
+        <h2 id="rejection-dialog-title">Exclude this image from export?</h2>
+        <p className="rejection-dialog-filename">{imageFilename}</p>
+        <p id="rejection-dialog-description">
+          The image will remain in this review group and can be restored. It will
+          not be included in future product export.
+        </p>
+        <div className="comparison-dialog-actions">
+          <button
+            type="button"
+            className="secondary-action"
+            disabled={isBusy}
+            onClick={onCancel}
+            ref={cancelButtonRef}
+          >
+            Cancel
+          </button>
+          <button type="button" disabled={isBusy} onClick={onConfirm}>
+            Exclude image
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -546,7 +1029,7 @@ function ReviewGroupCard({
   groups,
   groupIndex,
   categories,
-  isEditing,
+  isBusy,
   isReviewEditable,
   moveTargets,
   selectedImageIds,
@@ -554,6 +1037,8 @@ function ReviewGroupCard({
   onMoveTargetChange,
   onMarkDuplicate,
   onApproveGroup,
+  onRequestRejection,
+  onRestoreRejection,
   onSplit,
   onRestoreDuplicate,
   onSetCover,
@@ -564,7 +1049,7 @@ function ReviewGroupCard({
   groups: ReviewGroup[];
   groupIndex: number;
   categories: ReviewCategory[];
-  isEditing: boolean;
+  isBusy: boolean;
   isReviewEditable: boolean;
   moveTargets: Record<string, string>;
   selectedImageIds: Set<string>;
@@ -576,6 +1061,13 @@ function ReviewGroupCard({
     duplicateOfImageId: string,
   ) => void;
   onApproveGroup: (groupId: string) => void;
+  onRequestRejection: (
+    groupId: string,
+    imageId: string,
+    originalFilename: string,
+    trigger: HTMLButtonElement,
+  ) => void;
+  onRestoreRejection: (groupId: string, imageId: string) => void;
   onSplit: (groupId: string, imageIds: string[]) => void;
   onRestoreDuplicate: (groupId: string, imageId: string) => void;
   onSetCover: (groupId: string, imageId: string) => void;
@@ -591,7 +1083,15 @@ function ReviewGroupCard({
   const selectedGroupImageIds = group.images
     .filter((image) => selectedImageIds.has(image.imageId))
     .map((image) => image.imageId);
-  const canApproveGroup = group.approvedCategorySlug !== null;
+  const hasApprovedCategory = group.approvedCategorySlug !== null;
+  const hasActiveExportImage = group.images.some(
+    (image) => !image.isRejected && !image.isDuplicate,
+  );
+  const canApproveGroup = hasApprovedCategory && hasActiveExportImage;
+  const approvalAvailabilityMessage = groupApprovalAvailabilityMessage(
+    hasApprovedCategory,
+    hasActiveExportImage,
+  );
 
   return (
     <article className="group-card">
@@ -611,16 +1111,21 @@ function ReviewGroupCard({
           label="Suggested category"
           value={group.suggestedCategorySlug ?? "unknown"}
         />
+        <ReviewField
+          label="Suggestion status"
+          value={group.categorySuggestionStatus ?? "final"}
+        />
         <ReviewCategoryField
           approvedCategorySlug={group.approvedCategorySlug}
+          approvedCategorySource={group.approvedCategorySource}
           categories={categories}
           groupLabel={groupLabel}
-          isEditing={isEditing}
+          isBusy={isBusy}
           isEditable={isGroupEditable}
           onUpdateCategory={(approvedCategoryId) =>
             onUpdateCategory(group.groupId, approvedCategoryId)
           }
-          key={`${group.groupId}:${group.approvedCategorySlug ?? ""}`}
+          key={`${group.groupId}:${group.approvedCategorySlug ?? ""}:${group.approvedCategorySource ?? ""}`}
         />
         <ReviewField label="Confidence" value={formatConfidence(group.confidence)} />
         <ReviewField
@@ -646,7 +1151,7 @@ function ReviewGroupCard({
             <button
               type="button"
               disabled={
-                isEditing ||
+                isBusy ||
                 selectedGroupImageIds.length === 0 ||
                 selectedGroupImageIds.length >= group.images.length
               }
@@ -656,14 +1161,10 @@ function ReviewGroupCard({
             </button>
           </div>
           <div className="group-edit-action-block">
-            <span>
-              {canApproveGroup
-                ? "This group is ready for approval."
-                : "Select an approved category before approving this group."}
-            </span>
+            <span>{approvalAvailabilityMessage}</span>
             <button
               type="button"
-              disabled={isEditing || !canApproveGroup}
+              disabled={isBusy || !canApproveGroup}
               onClick={() => onApproveGroup(group.groupId)}
             >
               Approve group
@@ -678,18 +1179,31 @@ function ReviewGroupCard({
             editableTargetGroups={editableTargetGroups}
             groups={groups}
             image={image}
-            isEditing={isEditing}
+            groupImages={group.images}
+            isBusy={isBusy}
             isGroupEditable={isGroupEditable}
             isCover={image.imageId === group.coverImageId}
             moveTarget={moveTargets[image.imageId] ?? ""}
             nonDuplicateImages={group.images.filter(
-              (candidate) => !candidate.isDuplicate,
+              (candidate) =>
+                !candidate.isDuplicate && !candidate.isRejected,
             )}
             selected={selectedImageIds.has(image.imageId)}
             onMove={onMove}
             onMoveTargetChange={onMoveTargetChange}
             onMarkDuplicate={(imageId, duplicateOfImageId) =>
               onMarkDuplicate(group.groupId, imageId, duplicateOfImageId)
+            }
+            onRequestRejection={(imageId, originalFilename, trigger) =>
+              onRequestRejection(
+                group.groupId,
+                imageId,
+                originalFilename,
+                trigger,
+              )
+            }
+            onRestoreRejection={(imageId) =>
+              onRestoreRejection(group.groupId, imageId)
             }
             onRestoreDuplicate={(imageId) =>
               onRestoreDuplicate(group.groupId, imageId)
@@ -706,16 +1220,18 @@ function ReviewGroupCard({
 
 function ReviewCategoryField({
   approvedCategorySlug,
+  approvedCategorySource,
   categories,
   groupLabel,
-  isEditing,
+  isBusy,
   isEditable,
   onUpdateCategory,
 }: {
   approvedCategorySlug: string | null;
+  approvedCategorySource: ReviewGroup["approvedCategorySource"];
   categories: ReviewCategory[];
   groupLabel: string;
-  isEditing: boolean;
+  isBusy: boolean;
   isEditable: boolean;
   onUpdateCategory: (approvedCategoryId: string | null) => void;
 }) {
@@ -748,7 +1264,7 @@ function ReviewCategoryField({
         <select
           aria-label={`Approved category for ${groupLabel}`}
           value={selectedCategoryId}
-          disabled={!isEditable || isEditing}
+          disabled={!isEditable || isBusy}
           onChange={(event) => setSelectedCategoryId(event.target.value)}
         >
           <option value="">No approved category</option>
@@ -767,13 +1283,18 @@ function ReviewCategoryField({
             Current approved category is inactive or missing: {approvedCategorySlug}
           </span>
         ) : null}
+        {isEditable && approvedCategorySource === "machine_suggestion" ? (
+          <span className="category-source-note">
+            Prefilled from machine suggestion
+          </span>
+        ) : null}
         {isEditable ? (
           <div className="category-actions">
             <button
               type="button"
               className="secondary-action"
               aria-label={`Save category for ${groupLabel}`}
-              disabled={isEditing || !hasChanged}
+              disabled={isBusy || !hasChanged}
               onClick={() => onUpdateCategory(selectedCategoryId || null)}
             >
               Save category
@@ -782,7 +1303,7 @@ function ReviewCategoryField({
               type="button"
               className="secondary-action"
               aria-label={`Clear category for ${groupLabel}`}
-              disabled={isEditing || approvedCategorySlug === null}
+              disabled={isBusy || approvedCategorySlug === null}
               onClick={() => onUpdateCategory(null)}
             >
               Clear category
@@ -797,8 +1318,9 @@ function ReviewCategoryField({
 function ReviewImageCard({
   editableTargetGroups,
   groups,
+  groupImages,
   image,
-  isEditing,
+  isBusy,
   isCover,
   isGroupEditable,
   moveTarget,
@@ -807,14 +1329,17 @@ function ReviewImageCard({
   onMove,
   onMoveTargetChange,
   onMarkDuplicate,
+  onRequestRejection,
+  onRestoreRejection,
   onRestoreDuplicate,
   onSetCover,
   onToggleImageSelection,
 }: {
   editableTargetGroups: ReviewGroup[];
   groups: ReviewGroup[];
+  groupImages: ReviewGroupImage[];
   image: ReviewGroupImage;
-  isEditing: boolean;
+  isBusy: boolean;
   isCover: boolean;
   isGroupEditable: boolean;
   moveTarget: string;
@@ -823,6 +1348,12 @@ function ReviewImageCard({
   onMove: (imageId: string) => void;
   onMoveTargetChange: (imageId: string, targetGroupId: string) => void;
   onMarkDuplicate: (imageId: string, duplicateOfImageId: string) => void;
+  onRequestRejection: (
+    imageId: string,
+    originalFilename: string,
+    trigger: HTMLButtonElement,
+  ) => void;
+  onRestoreRejection: (imageId: string) => void;
   onRestoreDuplicate: (imageId: string) => void;
   onSetCover: (imageId: string) => void;
   onToggleImageSelection: (imageId: string) => void;
@@ -830,16 +1361,36 @@ function ReviewImageCard({
   const duplicateMasterOptions = nonDuplicateImages.filter(
     (candidate) => candidate.imageId !== image.imageId,
   );
+  const hasActiveDuplicateDependents =
+    !image.isDuplicate &&
+    groupImages.some(
+      (candidate) =>
+        candidate.isDuplicate &&
+        !candidate.isRejected &&
+        candidate.duplicateOfImageId === image.imageId,
+    );
+  const duplicateMaster =
+    image.duplicateOfImageId === null
+      ? null
+      : groupImages.find(
+          (candidate) => candidate.imageId === image.duplicateOfImageId,
+        ) ?? null;
+  const isRestorationBlocked =
+    image.isRejected &&
+    image.isDuplicate &&
+    duplicateMaster?.isRejected === true;
   const [duplicateMasterId, setDuplicateMasterId] = useState("");
 
   return (
-    <li className="image-card">
+    <li
+      className={`image-card${image.isRejected ? " image-card-rejected" : ""}`}
+    >
       {isGroupEditable ? (
         <label className="image-selection">
           <input
             type="checkbox"
             checked={selected}
-            disabled={isEditing}
+            disabled={isBusy}
             onChange={() => onToggleImageSelection(image.imageId)}
           />
           <span>Select {image.originalFilename}</span>
@@ -863,6 +1414,9 @@ function ReviewImageCard({
         <span className="filename">{image.originalFilename}</span>
         <div className="review-image-badges">
           {isCover ? <span className="cover-label">Cover</span> : null}
+          {image.isRejected ? (
+            <span className="rejected-label">Excluded from export</span>
+          ) : null}
           {image.isDuplicate ? (
             <span className="duplicate-label">Duplicate</span>
           ) : (
@@ -882,21 +1436,62 @@ function ReviewImageCard({
       </div>
       {isGroupEditable ? (
         <div className="image-edit-controls">
-          {!image.isDuplicate && !isCover ? (
+          {!image.isDuplicate && !image.isRejected && !isCover ? (
             <button
               type="button"
               className="secondary-action"
-              disabled={isEditing}
+              disabled={isBusy}
               onClick={() => onSetCover(image.imageId)}
             >
               Set cover
             </button>
           ) : null}
+          <div className="rejection-controls">
+            {image.isRejected ? (
+              <button
+                type="button"
+                className="secondary-action"
+                aria-label={`Restore ${image.originalFilename} for export`}
+                disabled={isBusy || isRestorationBlocked}
+                onClick={() => onRestoreRejection(image.imageId)}
+              >
+                Restore for export
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="secondary-action"
+                aria-label={`Reject ${image.originalFilename} from export`}
+                disabled={isBusy || hasActiveDuplicateDependents}
+                onClick={(event) =>
+                  onRequestRejection(
+                    image.imageId,
+                    image.originalFilename,
+                    event.currentTarget,
+                  )
+                }
+              >
+                Reject from export
+              </button>
+            )}
+            {hasActiveDuplicateDependents ? (
+              <span className="image-action-note">
+                Restore or reassign active duplicates before rejecting this
+                duplicate master.
+              </span>
+            ) : null}
+            {isRestorationBlocked ? (
+              <span className="image-action-note">
+                Restore or replace the duplicate master before restoring this
+                image for export.
+              </span>
+            ) : null}
+          </div>
           {image.isDuplicate ? (
             <button
               type="button"
               className="secondary-action"
-              disabled={isEditing}
+              disabled={isBusy}
               onClick={() => onRestoreDuplicate(image.imageId)}
             >
               Restore duplicate
@@ -908,7 +1503,7 @@ function ReviewImageCard({
                 <select
                   aria-label={`Duplicate master for ${image.originalFilename}`}
                   value={duplicateMasterId}
-                  disabled={isEditing || duplicateMasterOptions.length === 0}
+                  disabled={isBusy || duplicateMasterOptions.length === 0}
                   onChange={(event) => setDuplicateMasterId(event.target.value)}
                 >
                   <option value="">Choose image</option>
@@ -921,7 +1516,7 @@ function ReviewImageCard({
               </label>
               <button
                 type="button"
-                disabled={isEditing || !duplicateMasterId}
+                disabled={isBusy || !duplicateMasterId}
                 onClick={() => onMarkDuplicate(image.imageId, duplicateMasterId)}
               >
                 Mark duplicate
@@ -934,7 +1529,7 @@ function ReviewImageCard({
               <select
                 aria-label={`Target group for ${image.originalFilename}`}
                 value={moveTarget}
-                disabled={isEditing || editableTargetGroups.length === 0}
+                disabled={isBusy || editableTargetGroups.length === 0}
                 onChange={(event) =>
                   onMoveTargetChange(image.imageId, event.target.value)
                 }
@@ -949,7 +1544,7 @@ function ReviewImageCard({
             </label>
             <button
               type="button"
-              disabled={isEditing || !moveTarget}
+              disabled={isBusy || !moveTarget}
               onClick={() => onMove(image.imageId)}
             >
               Move
@@ -993,6 +1588,25 @@ function ReviewField({ label, value }: { label: string; value: string }) {
 
 function formatConfidence(confidence: number | null): string {
   return confidence === null ? "unknown" : confidence.toFixed(2);
+}
+
+function groupApprovalAvailabilityMessage(
+  hasApprovedCategory: boolean,
+  hasActiveExportImage: boolean,
+): string {
+  if (hasApprovedCategory && hasActiveExportImage) {
+    return "This group is ready for approval.";
+  }
+  if (!hasApprovedCategory && !hasActiveExportImage) {
+    return (
+      "Select an approved category and restore at least one non-duplicate " +
+      "image before approving this group."
+    );
+  }
+  if (!hasApprovedCategory) {
+    return "Select an approved category before approving this group.";
+  }
+  return "Restore at least one non-duplicate image before approving this group.";
 }
 
 function reviewGroupLabel(groups: ReviewGroup[], groupId: string): string {

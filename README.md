@@ -102,7 +102,7 @@ FastAPI owns:
 * workflow state;
 * review operations;
 * job creation;
-* Bazoria product-draft export commands.
+* approved-group read and later export contracts for Bazoria product drafts.
 
 FastAPI must not perform image classification inside normal user-facing HTTP requests.
 
@@ -461,8 +461,23 @@ Rules:
   category is not in the active global taxonomy.
 * Store `unknown` as a null `category_id` in `image_classifications`.
 * Store the raw model response for debugging.
-* Category classification is a suggestion until approved.
+* Category classification remains machine-derived until explicit group
+  approval, even when ticket `0022e` uses it to prefill
+  `approved_category_id`.
 * Malformed JSON or provider failures are retryable and do not persist a row.
+
+After grouping, ticket `0022e` reconciles late current-pipeline image
+classifications into a group-level suggestion. It uses only non-rejected,
+non-duplicate memberships. A group exposes a machine suggestion only after no
+eligible image has a pending or started classification job and every available
+accepted classification agrees on one active leaf category. Missing or failed
+classifications are neutral; they never block manual review. A reviewer may
+approve a manually selected category while classification remains pending.
+When a suggestion is ready and no reviewer decision exists, reconciliation
+prefills `approved_category_id` while leaving the group `proposed`. A reviewer
+may change or clear that value; source tracking prevents later reconciliation
+from overwriting reviewer intent. Reconciliation never changes an approved
+group or automatically approves a group or batch.
 
 Initial seeded categories include:
 
@@ -546,9 +561,74 @@ Use these threshold bands for pair decisions:
 Missing embeddings or hashes do not fail grouping; they only reduce available
 evidence. When evidence is insufficient, keep the image singleton.
 
-If the deterministic signals are still too conservative, add multimodal
-comparison later in ticket `0021`. Do not send every possible pair to the
-generative model in the first grouping slice.
+If the deterministic signals are still too conservative, ticket `0021` adds an
+optional multimodal refinement endpoint:
+
+```http
+POST /v1/upload-batches/{batchId}/run-multimodal-comparison
+```
+
+The normal grouping pipeline must never call this endpoint automatically. The
+endpoint considers only canonical heuristic `uncertain` pairs in a
+`review_required` batch with no review events. It sorts eligible pairs by
+embedding similarity, applies a configurable per-batch comparison cap, and
+uses the existing derived thumbnail bytes. It never compares both `A-B` and
+`B-A`, creates new image derivatives, overrides exact duplicates or category
+conflicts, or runs after human review activity.
+
+The durable review page exposes this endpoint through an explicit
+`Run multimodal comparison` action before manual review begins. The operator
+must confirm the potentially billable Google Gemini request. While the
+synchronous request runs, the page keeps current groups visible and disables
+all review mutations. A successful response replaces the rendered review
+snapshot and clears transient edit selections. The interface reports completion
+without inventing pair or group-change counts that the endpoint does not
+return. Backend conflict and infrastructure messages remain authoritative.
+
+Serialize runs with a synchronous `ProcessingJob` claim using
+`job_type = multimodal-compare-batch`. In a short transaction, lock the batch
+row and reject when any non-stale `pending` or `started` comparison job exists
+for the same batch and pipeline version, regardless of its pair-set
+fingerprint. Build the idempotency fingerprint from the sorted, capped
+canonical pair identifiers selected from database state before reading
+thumbnail objects. Storage readability must not change the fingerprint.
+
+Configure abandoned-claim recovery with
+`CATALOG_MULTIMODAL_CLAIM_TIMEOUT_SECONDS`, defaulting to 900 seconds. An active
+claim older than that limit is marked failed with
+`multimodal_comparison_claim_expired` and may be retried. Bound each model
+request with `CATALOG_MULTIMODAL_PROVIDER_TIMEOUT_SECONDS`, defaulting to 30
+seconds. The first implementation invokes model calls sequentially, so validate
+that the claim timeout is at least the comparison cap multiplied by the provider
+timeout, plus a 120-second margin for storage and final database work. The
+defaults satisfy `20 * 30 + 120 = 720` seconds within the 900-second claim
+timeout. Do not keep a database transaction open during model calls.
+
+Each claim attempt retains its `attempt_count` as an attempt token. The final
+write must verify the claim ownership tuple: the same `ProcessingJob.id`,
+`status = started`, and `attempt_count` equal to the retained attempt token.
+Apply this fence before every terminal job mutation and every pair, group, or
+batch write, including provider-failure and state-error handling. An old
+provider call that returns after its claim expires and a newer retry begins must
+return `409 multimodal_comparison_claim_lost` without changing any row. A late
+failure must not mark the newer retry failed.
+
+Startup validation rejects non-positive comparison caps, provider timeouts, and
+claim timeouts, in addition to enforcing the complete sequential run-budget
+formula.
+
+The first provider uses Google Gemini through the existing `google-genai`
+integration and `GEMINI_API_KEY`. Configure the model with
+`CATALOG_MULTIMODAL_MODEL`, defaulting to `gemini-2.5-flash`. A valid
+high-confidence `same_product` response may upgrade an uncertain pair. Valid
+`different_product`, `uncertain`, and low-confidence `same_product` responses
+are persisted with `decision_source = multimodal_model`.
+
+Provider responses are collected and validated before database changes. A
+provider error or malformed response fails the complete run and leaves pair
+assessments and groups unchanged. Missing thumbnails skip only the affected
+pair. When no eligible heuristic pairs remain, the endpoint returns the
+unchanged review snapshot as a successful no-op.
 
 Persist:
 
@@ -652,7 +732,8 @@ Required operations:
 * restore a duplicate;
 * change category;
 * select cover image;
-* image rejection is deferred (ticket `0022`);
+* reject or restore an image after ticket `0022` provides the backend contract
+  and ticket `0022b` adds the review-page controls;
 * approve a group.
 
 Every manual action must be stored as a review event.
@@ -894,6 +975,7 @@ membership_source
 membership_confidence
 is_duplicate
 duplicate_of_image_id
+is_rejected
 ```
 
 Enforce one row per `(organization_id, batch_id, image_id)` and a unique
@@ -906,6 +988,9 @@ memberships.
 `position` follows the image `upload_order` within the group.
 `duplicate_of_image_id` must be null or point to another image in the same
 organization, batch, and group.
+Ticket `0022` adds `is_rejected boolean not null default false`. Rejection is a
+membership-level export-eligibility decision: the image remains visible in
+review and in its group, but future product export must omit it.
 
 #### `review_events`
 
@@ -925,6 +1010,7 @@ Review events store the minimum audit data needed for review edits and approval
 tracking. Suggested `action_type` values are `create_group`, `move_image`,
 `remove_image`, `merge_groups`, `split_group`, `update_group`,
 `mark_duplicate`, `restore_duplicate`, `approve_group`, and `approve_batch`.
+Ticket `0022` adds `reject_image` and `restore_rejection`.
 Successful no-op requests do not write a review event.
 
 Implementation should use stricter database constraints where practical:
@@ -1030,28 +1116,40 @@ For `POST /v1/groups/{groupId}/split`, empty selections are invalid. Selecting
 images that already exactly match the current group membership is a no-op
 success. Selecting a single image is allowed and creates a singleton group.
 Group approval requires the batch to be `review_required`, the group to be
-`proposed`, and the group to have a non-null approved category.
+`proposed`, and the group to have a non-null active leaf approved category with
+a valid category source. Ticket `0022e` prefills that category from a ready
+machine suggestion while leaving the group proposed. A saved manual category
+or explicit clear is authoritative even while classifications remain pending.
+The approval event records whether the persisted category came from
+`machine_suggestion` or `reviewer_selection`. After ticket `0022`, approval also
+requires at least one active, non-duplicate membership.
 Batch approval only changes batch state; it does not mutate group memberships
 or duplicate flags. Batch approval requires all groups in the batch to already
 be approved.
 Every successful review mutation returns the updated review snapshot from
 `GET /v1/upload-batches/{batchId}/groups`.
 
-### Future Review API: Ticket 0022
+### Planned Review API: Ticket 0022
 
-Image rejection is deferred. The active Review API contract does not include
-rejection endpoints or `isRejected` snapshot fields.
+Ticket `0022` adds membership-level image rejection. Until that ticket is
+implemented, the active Review API does not include rejection endpoints or
+`isRejected` snapshot fields.
 
-If product later decides to add rejection, a likely shape is:
+The planned contract is:
 
-* store rejection state on `product_group_images.is_rejected`;
-* expose `isRejected` in the review snapshot;
-* add reject and restore review actions and corresponding review events;
-* define how rejection interacts with cover images, duplicate masters, and
-  empty groups.
+* `POST /v1/groups/{groupId}/images/{imageId}/reject` and
+  `POST /v1/groups/{groupId}/images/{imageId}/restore-rejection`;
+* store the flag on `product_group_images.is_rejected` and expose it as
+  `isRejected` in the review snapshot;
+* keep rejected images visible and grouped, while excluding them from future
+  export;
+* normalize a rejected cover image to the first active, non-duplicate member;
+* prevent a rejected duplicate master from leaving active duplicates without a
+  master; and
+* block approval when a group has no active, non-duplicate membership.
 
-Ticket `0022` will define those semantics if and when product decides to add
-them.
+The backend contract comes first. Ticket `0022b` adds the review-page reject
+and restore controls.
 
 ### Processing API
 
@@ -1131,16 +1229,88 @@ images are excluded, and classification does not gate grouping.
 
 Do not export every raw ingestion image into Bazoria Web immediately.
 
-Export flow:
+The first integration is read-only:
+
+```http
+GET /v1/upload-batches/{batchId}/approved-groups
+```
+
+An authorized Bazoria operator starts import in Bazoria Web. The Bazoria backend
+reads this endpoint and creates or reuses its own `ProductDraft`; the classifier
+does not write Bazoria data. The endpoint returns `404` for an unknown batch,
+`409` for a batch that is not approved, and `200` with `groups: []` for an
+approved batch with no groups.
+
+The local prototype endpoint is disabled by default. Set
+`CATALOG_APPROVED_GROUPS_EXPORT_ENABLED=true` to enable it for the existing
+default organization. When disabled, it returns
+`404 approved_groups_export_disabled` before looking up the batch. This setting
+is not authentication and must remain disabled in production until
+organization-aware service-to-service authentication and authorization exist.
+When enabled, an unknown batch returns `404 batch_not_found` and a batch that is
+not approved returns `409 batch_not_approved`.
+
+The response contains the approved group category slugs, cover image identifier,
+confidence, and active non-rejected memberships in deterministic order. Each
+membership includes its classifier image identifier, position, and duplicate
+metadata. Ticket `0024` uses those identifiers with an authenticated
+server-to-server classifier image-read endpoint to transfer normalized JPEG
+bytes into Bazoria-owned storage. The classifier never exposes an object key,
+public URL, or browser-facing signed URL for this flow.
+
+`pipelineVersion`, `approvedCategorySlug`, and `coverImageId` are required in an
+approved export. `suggestedCategorySlug` and group `confidence` may be `null`.
+An image `duplicateOfImageId` is non-null exactly when `isDuplicate` is true.
+Before returning data, the classifier validates the complete snapshot: every
+group is approved, every group has an approved category slug and an active
+non-duplicate image, the cover points to one such included image, and every
+active duplicate points to an included active non-duplicate image in the same
+group. A missing pipeline version or any broken invariant returns
+`409 approved_groups_invalid` with no partial payload and no repair mutation.
+
+Bazoria imports only the approved category slug. Any suggested category is
+diagnostic context and must not change the ProductDraft category. Group
+confidence is informational grouping confidence, not category confidence or an
+import threshold. Image positions are source membership positions and are not
+reindexed after rejected memberships are omitted, so gaps are valid.
+
+Bazoria Web prevents duplicate drafts with a unique source identity of
+`(classifierOrganizationId, classifierGroupId)`. Repeated reads do not mutate
+classifier state. The classifier does not expose its database category IDs;
+Bazoria consumes the stable approved category slug and maps it by exact match to
+an active, selectable Bazoria category. A missing or inactive mapping fails that
+group import; Bazoria must not select a fallback category or promote its images.
+
+The `/v1/` route version defines the approved-groups response contract.
+`pipelineVersion` identifies the classifier processing pipeline rather than the
+response schema. A backwards-incompatible export change requires a new
+versioned endpoint.
+
+Production use requires seller-to-organization mapping and a service-to-service
+authorization boundary. Until those exist, this endpoint is a local
+default-organization prototype only.
+
+Import flow:
 
 1. User approves the product group.
-2. Backend validates the product record.
-3. Approved groups are exported to Bazoria Web as product-draft payloads.
-4. Bazoria Web persists the product draft and handles public publication later.
+2. A Bazoria operator explicitly starts import.
+3. Bazoria Web reads the approved groups and creates or reuses one ProductDraft
+   per approved group.
+4. Bazoria Web promotes that group's approved normalized images in ticket
+   `0024`, then handles public publication later.
 
-The backend must validate all required fields before exporting a product draft.
+Ticket `0024` uses one Bazoria image-promotion record per
+`(productDraftId, classifierImageId)` and a deterministic Bazoria storage key.
+A failed or pending required image leaves the ProductDraft incomplete and not
+eligible for publication; retries reuse the same draft, promotion record, and
+destination key.
 
-Recommended product-draft fields:
+The initial import payload does not contain a product code, generated name,
+description, price, stock, sizes, or public image URL. Those are Bazoria-owned
+draft concerns handled in later tickets.
+
+Later Bazoria `ProductDraft` fields, not part of the initial approved-groups
+payload:
 
 ```text
 productCode
@@ -1159,7 +1329,8 @@ status
 sourceBatchId
 ```
 
-Exporting must be explicit and initiated by an authorized user. Classification completion must never automatically create a product draft.
+Importing must be explicit and initiated by an authorized user. Classification
+completion must never automatically create a product draft.
 
 ---
 
@@ -1180,20 +1351,41 @@ Use a database sequence or transactionally locked counter to guarantee uniquenes
 
 ### Multilingual descriptions
 
-Generate one structured source representation first:
+Bazoria Web owns one reviewed, versioned structured facts record per
+`ProductDraft`. The catalog-classifier supplies the approved category and images;
+it does not persist ProductDraft facts. Generate descriptions from the reviewed
+facts revision, not directly from classifier output.
+
+The first facts version is intentionally small and apparel-oriented:
 
 ```json
 {
+  "schemaVersion": 1,
   "productType": "sports t-shirt",
-  "material": null,
-  "fit": "regular",
   "colors": ["black", "red"],
-  "features": ["short sleeves"],
-  "uncertainFields": ["material"]
+  "pattern": null,
+  "fit": "regular",
+  "material": null,
+  "visibleFeatures": ["short sleeves"],
+  "uncertainFields": ["material"],
+  "fieldSources": {
+    "productType": "human",
+    "colors": "human",
+    "pattern": null,
+    "fit": "human",
+    "material": null,
+    "visibleFeatures": "human"
+  }
 }
 ```
 
 Then produce Polish, Vietnamese, German, and English catalog text from the structured record.
+
+A human change or explicit clear replaces a model-assisted value for that field.
+Automatic model-assisted fact suggestions are a later capability; they must not
+override reviewed facts. The facts revision used for generated text is recorded,
+and a later facts edit marks earlier generated text as outdated rather than
+overwriting human edits.
 
 Do not allow the model to invent:
 
@@ -1703,7 +1895,14 @@ Keep this milestone narrow and vertical:
 3. Add the review editing API in ticket `0019a` and the approval workflow in
    ticket `0019b`.
 4. Add the review workbench UI across tickets `0020a` through `0020e`.
-   Ticket `0022` is deferred until image-rejection semantics are decided.
+5. Add membership-level rejection backend support in ticket `0022`, followed by
+   reject and restore controls in ticket `0022b`.
+6. Add terminal grouping-failure handling in ticket `0022c`, so a failed
+   grouping task does not leave a batch in `processing` indefinitely.
+7. Connect the processing page to the durable review page in ticket `0022d`
+   after backend grouping reaches its terminal batch state.
+8. Reconcile late category suggestions, prefill approved categories when known,
+   and preserve one-click group approval in ticket `0022e`.
 
 Milestone 3 ends with proposed same-product groups stored in PostgreSQL and a
 review page that lets an operator correct and approve them.

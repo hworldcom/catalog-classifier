@@ -10,7 +10,11 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
 from catalog_api.embedding_vectors import EMBEDDING_DIMENSIONS
-from catalog_api.grouping import GroupingSettings, group_batch_task
+from catalog_api.grouping import (
+    GroupingSettings,
+    group_batch_task,
+    record_group_batch_terminal_failure,
+)
 from catalog_api.image_processing import JPEG_CONTENT_TYPE
 from catalog_api.models import (
     Category,
@@ -24,9 +28,11 @@ from catalog_api.models import (
     UploadBatch,
 )
 from catalog_api.processing_jobs import (
+    CLASSIFY_IMAGE_JOB_TYPE,
     GROUP_BATCH_JOB_TYPE,
     PROCESS_IMAGE_JOB_TYPE,
     GroupBatchTaskPayload,
+    classify_image_idempotency_key,
     group_batch_idempotency_key,
     process_image_idempotency_key,
 )
@@ -102,6 +108,9 @@ async def test_group_batch_worker_creates_same_product_group(
     assert category is not None
     assert len(groups) == 1
     assert groups[0].suggested_category_id == category.id
+    assert groups[0].approved_category_id == category.id
+    assert groups[0].approved_category_source == "machine_suggestion"
+    assert groups[0].status == "proposed"
     assert groups[0].cover_image_id == image_ids[0]
     assert [membership.image_id for membership in memberships] == image_ids
     assert all(membership.membership_source == "engine" for membership in memberships)
@@ -384,6 +393,89 @@ async def test_group_batch_is_idempotent_when_groups_exist(
     assert job.attempt_count == 1
 
 
+@pytest.mark.parametrize("terminal_status", ["review_required", "approved"])
+async def test_group_batch_terminal_failure_does_not_regress_completed_grouping(
+    migrated_engine: Engine,
+    terminal_status: str,
+) -> None:
+    with Session(migrated_engine) as session:
+        batch_id, _ = _create_grouping_batch(
+            session,
+            specs=[
+                GroupingImageSpec(upload_order=0, embedding=(1.0, 0.0)),
+                GroupingImageSpec(upload_order=1, embedding=(0.99, 0.10)),
+            ],
+        )
+
+    payload = GroupBatchTaskPayload(
+        batch_id=batch_id,
+        pipeline_version=PIPELINE_VERSION,
+    )
+    with Session(migrated_engine) as session:
+        group_batch_task(
+            session,
+            payload=payload,
+            settings=_strict_grouping_settings(),
+        )
+    if terminal_status == "approved":
+        with Session(migrated_engine) as session:
+            batch = session.get(UploadBatch, batch_id)
+            assert batch is not None
+            batch.status = "approved"
+            session.commit()
+
+    with Session(migrated_engine) as session:
+        did_record_failure = record_group_batch_terminal_failure(
+            session,
+            payload=payload,
+        )
+    with Session(migrated_engine) as session:
+        batch = session.get(UploadBatch, batch_id)
+        job = session.scalar(
+            select(ProcessingJob).where(
+                ProcessingJob.batch_id == batch_id,
+                ProcessingJob.job_type == GROUP_BATCH_JOB_TYPE,
+            )
+        )
+
+    assert did_record_failure is False
+    assert batch is not None
+    assert batch.status == terminal_status
+    assert job is not None
+    assert job.status == "completed"
+    assert job.error_message is None
+
+
+async def test_group_batch_terminal_failure_is_noop_for_missing_rows(
+    migrated_engine: Engine,
+) -> None:
+    payload = GroupBatchTaskPayload(
+        batch_id=uuid4(),
+        pipeline_version=PIPELINE_VERSION,
+    )
+    with Session(migrated_engine) as session:
+        batch_count_before = session.scalar(
+            select(func.count()).select_from(UploadBatch)
+        )
+        job_count_before = session.scalar(
+            select(func.count()).select_from(ProcessingJob)
+        )
+        did_record_failure = record_group_batch_terminal_failure(
+            session,
+            payload=payload,
+        )
+        batch_count_after = session.scalar(
+            select(func.count()).select_from(UploadBatch)
+        )
+        job_count_after = session.scalar(
+            select(func.count()).select_from(ProcessingJob)
+        )
+
+    assert did_record_failure is False
+    assert batch_count_after == batch_count_before
+    assert job_count_after == job_count_before
+
+
 async def test_group_batch_moves_empty_eligible_batch_to_review(
     migrated_engine: Engine,
 ) -> None:
@@ -504,6 +596,21 @@ def _create_grouping_batch(
                 )
             )
         if spec.category_slug is not None and spec.status == "processed":
+            session.add(
+                ProcessingJob(
+                    organization_id=DEFAULT_ORGANIZATION_ID,
+                    batch_id=batch.id,
+                    image_id=image_id,
+                    job_type=CLASSIFY_IMAGE_JOB_TYPE,
+                    status="completed",
+                    pipeline_version=PIPELINE_VERSION,
+                    completed_at=datetime.now(UTC),
+                    idempotency_key=classify_image_idempotency_key(
+                        image_id=image_id,
+                        pipeline_version=PIPELINE_VERSION,
+                    ),
+                )
+            )
             session.add(
                 ImageClassification(
                     organization_id=DEFAULT_ORGANIZATION_ID,

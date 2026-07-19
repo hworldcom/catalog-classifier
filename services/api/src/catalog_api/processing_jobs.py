@@ -16,6 +16,7 @@ from catalog_api.category_suggestion_providers import (
     generate_category_suggestion,
 )
 from catalog_api.embedding_vectors import EMBEDDING_DIMENSIONS
+from catalog_api.group_category_reconciliation import reconcile_groups_for_image
 from catalog_api.image_embedding_providers import (
     ImageEmbeddingResult,
     ImageEmbeddingProvider,
@@ -720,6 +721,12 @@ def classify_image_task(
         job.status = "completed"
         job.completed_at = job.completed_at or datetime.now(UTC)
         job.error_message = None
+        reconcile_groups_for_image(
+            session,
+            batch_id=image.batch_id,
+            organization_id=image.organization_id,
+            image_id=image.id,
+        )
         session.commit()
         return ClassifyImageTaskResult(
             batch_id=payload.batch_id,
@@ -751,6 +758,12 @@ def classify_image_task(
             error_code="classification_input_read_failed",
             error_message="The inference image could not be read.",
         )
+        reconcile_groups_for_image(
+            session,
+            batch_id=image.batch_id,
+            organization_id=image.organization_id,
+            image_id=image.id,
+        )
         session.commit()
         raise ProcessingJobExecutionError(
             error_code="classification_input_read_failed",
@@ -770,6 +783,12 @@ def classify_image_task(
             job=job,
             error_code="category_suggestion_failed",
             error_message="The category suggestion could not be generated.",
+        )
+        reconcile_groups_for_image(
+            session,
+            batch_id=image.batch_id,
+            organization_id=image.organization_id,
+            image_id=image.id,
         )
         session.commit()
         raise ProcessingJobExecutionError(
@@ -805,6 +824,12 @@ def classify_image_task(
     job.status = "completed"
     job.completed_at = datetime.now(UTC)
     job.error_message = None
+    reconcile_groups_for_image(
+        session,
+        batch_id=image.batch_id,
+        organization_id=image.organization_id,
+        image_id=image.id,
+    )
     session.commit()
 
     return ClassifyImageTaskResult(

@@ -8,6 +8,11 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from catalog_api.group_category_reconciliation import (
+    APPROVED_CATEGORY_SOURCE_CLEARED,
+    APPROVED_CATEGORY_SOURCE_REVIEWER,
+    reconcile_batch_group_categories,
+)
 from catalog_api.models import (
     Category,
     ImageAsset,
@@ -20,6 +25,12 @@ from catalog_api.review_groups import ReviewBatchGroupsState, get_review_batch_g
 from catalog_api.upload_batches import DEFAULT_ORGANIZATION_ID
 
 MEMBERSHIP_SOURCE_MANUAL_REVIEW = "manual_review"
+IMAGE_REJECTION_DUPLICATE_MASTER_IN_USE = (
+    "image_rejection_duplicate_master_in_use"
+)
+IMAGE_REJECTION_DUPLICATE_MASTER_REJECTED = (
+    "image_rejection_duplicate_master_rejected"
+)
 
 
 class ReviewEditBatchNotFoundError(Exception):
@@ -36,6 +47,14 @@ class ReviewEditStateError(Exception):
 
 class ReviewEditValidationError(Exception):
     """Raised when a review edit request is invalid."""
+
+
+class ReviewEditConflictError(Exception):
+    """Raised when a review edit conflicts with another review decision."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -61,6 +80,10 @@ def create_review_group(
     existing_memberships = _memberships_by_image_id(session, batch=batch)
     if any(image_id not in existing_memberships for image_id in selected_image_ids):
         raise ReviewEditResourceNotFoundError("Image membership was not found.")
+    rejection_state_by_image_id = {
+        image_id: existing_memberships[image_id].is_rejected
+        for image_id in selected_image_ids
+    }
 
     selected_set = set(selected_image_ids)
     for group_id in {
@@ -97,6 +120,7 @@ def create_review_group(
                 group_id=new_group.id,
                 image_id=image_id,
                 position=position,
+                is_rejected=rejection_state_by_image_id[image_id],
             )
         )
 
@@ -133,6 +157,7 @@ def move_image_to_group(
         return get_review_batch_groups(session, batch_id=batch.id)
 
     source_group_id = membership.group_id
+    is_rejected = membership.is_rejected
     session.delete(membership)
     session.flush()
     session.add(
@@ -141,6 +166,7 @@ def move_image_to_group(
             group_id=target_group.id,
             image_id=image_id,
             position=_next_group_position(session, batch=batch, group_id=target_group.id),
+            is_rejected=is_rejected,
         )
     )
 
@@ -178,6 +204,7 @@ def remove_image_from_group(
     group_memberships = _memberships_for_group(session, batch=batch, group_id=group.id)
     if len(group_memberships) == 1:
         return get_review_batch_groups(session, batch_id=batch.id)
+    is_rejected = membership.is_rejected
 
     singleton_group = ProductGroup(
         organization_id=batch.organization_id,
@@ -196,6 +223,7 @@ def remove_image_from_group(
             group_id=singleton_group.id,
             image_id=image_id,
             position=0,
+            is_rejected=is_rejected,
         )
     )
 
@@ -242,7 +270,7 @@ def merge_review_groups(
         raise ReviewEditResourceNotFoundError("Source group was not found.")
     _ensure_groups_editable([target_group, *source_groups.values()])
 
-    moved_image_ids: list[UUID] = []
+    moved_memberships: list[tuple[UUID, bool]] = []
     for source_group_id in unique_source_group_ids:
         source_memberships = _memberships_for_group(
             session,
@@ -250,7 +278,9 @@ def merge_review_groups(
             group_id=source_group_id,
         )
         for membership in source_memberships:
-            moved_image_ids.append(membership.image_id)
+            moved_memberships.append(
+                (membership.image_id, membership.is_rejected)
+            )
             session.delete(membership)
     session.flush()
 
@@ -263,13 +293,14 @@ def merge_review_groups(
         batch=batch,
         group_id=target_group.id,
     )
-    for offset, image_id in enumerate(moved_image_ids):
+    for offset, (image_id, is_rejected) in enumerate(moved_memberships):
         session.add(
             _manual_membership(
                 batch=batch,
                 group_id=target_group.id,
                 image_id=image_id,
                 position=next_position + offset,
+                is_rejected=is_rejected,
             )
         )
 
@@ -283,7 +314,9 @@ def merge_review_groups(
         payload={
             "targetGroupId": str(target_group.id),
             "sourceGroupIds": _string_ids(unique_source_group_ids),
-            "movedImageIds": _string_ids(moved_image_ids),
+            "movedImageIds": _string_ids(
+                [image_id for image_id, _ in moved_memberships]
+            ),
         },
     )
     session.commit()
@@ -300,6 +333,10 @@ def split_review_group(
     group, batch = _review_group_and_batch(session, group_id=group_id)
     group_memberships = _memberships_for_group(session, batch=batch, group_id=group.id)
     group_image_ids = {membership.image_id for membership in group_memberships}
+    rejection_state_by_image_id = {
+        membership.image_id: membership.is_rejected
+        for membership in group_memberships
+    }
     selected_set = set(selected_image_ids)
 
     if not selected_set.issubset(group_image_ids):
@@ -329,6 +366,7 @@ def split_review_group(
                 group_id=new_group.id,
                 image_id=image_id,
                 position=position,
+                is_rejected=rejection_state_by_image_id[image_id],
             )
         )
 
@@ -372,6 +410,8 @@ def update_review_group(
         )
         if membership.is_duplicate:
             raise ReviewEditValidationError("coverImageId must not be a duplicate.")
+        if membership.is_rejected:
+            raise ReviewEditValidationError("coverImageId must not be rejected.")
         if group.cover_image_id == patch.cover_image_id:
             return get_review_batch_groups(session, batch_id=batch.id)
         changed_payload["before"] = {"coverImageId": _optional_str(group.cover_image_id)}
@@ -381,14 +421,25 @@ def update_review_group(
     if patch.has_approved_category_id:
         if patch.approved_category_id is not None:
             _category(session, category_id=patch.approved_category_id)
-        if group.approved_category_id == patch.approved_category_id:
+        approved_category_source = (
+            APPROVED_CATEGORY_SOURCE_REVIEWER
+            if patch.approved_category_id is not None
+            else APPROVED_CATEGORY_SOURCE_CLEARED
+        )
+        if (
+            group.approved_category_id == patch.approved_category_id
+            and group.approved_category_source == approved_category_source
+        ):
             return get_review_batch_groups(session, batch_id=batch.id)
         changed_payload["before"] = {
-            "approvedCategoryId": _optional_str(group.approved_category_id)
+            "approvedCategoryId": _optional_str(group.approved_category_id),
+            "approvedCategorySource": group.approved_category_source,
         }
         group.approved_category_id = patch.approved_category_id
+        group.approved_category_source = approved_category_source
         changed_payload["after"] = {
-            "approvedCategoryId": _optional_str(patch.approved_category_id)
+            "approvedCategoryId": _optional_str(patch.approved_category_id),
+            "approvedCategorySource": approved_category_source,
         }
 
     _write_review_event(
@@ -436,6 +487,11 @@ def update_group_image_duplicate(
             raise ReviewEditValidationError(
                 "duplicateOfImageId must point to a non-duplicate image."
             )
+        if retained_membership.is_rejected:
+            raise ReviewEditConflictError(
+                code=IMAGE_REJECTION_DUPLICATE_MASTER_REJECTED,
+                message="A rejected image cannot be selected as a duplicate master.",
+            )
     elif duplicate_of_image_id is not None:
         raise ReviewEditValidationError(
             "duplicateOfImageId must be null when isDuplicate is false."
@@ -472,6 +528,106 @@ def update_group_image_duplicate(
                 "isDuplicate": is_duplicate,
                 "duplicateOfImageId": _optional_str(duplicate_of_image_id),
             },
+        },
+    )
+    session.commit()
+    return get_review_batch_groups(session, batch_id=batch.id)
+
+
+def reject_group_image(
+    session: Session,
+    *,
+    group_id: UUID,
+    image_id: UUID,
+) -> ReviewBatchGroupsState:
+    group, batch = _review_group_and_batch(session, group_id=group_id)
+    membership = _membership_in_group(
+        session,
+        batch=batch,
+        group_id=group.id,
+        image_id=image_id,
+    )
+    if membership.is_rejected:
+        return get_review_batch_groups(session, batch_id=batch.id)
+
+    if not membership.is_duplicate and _has_active_duplicates(
+        session,
+        batch=batch,
+        group_id=group.id,
+        master_image_id=image_id,
+    ):
+        raise ReviewEditConflictError(
+            code=IMAGE_REJECTION_DUPLICATE_MASTER_IN_USE,
+            message=(
+                "Restore or reassign active duplicates before rejecting "
+                "their master."
+            ),
+        )
+
+    membership.is_rejected = True
+    _normalize_batch_groups(session, batch=batch)
+    _write_review_event(
+        session,
+        batch=batch,
+        action_type="reject_image",
+        group_id=group.id,
+        image_id=image_id,
+        payload={
+            "groupId": str(group.id),
+            "imageId": str(image_id),
+            "before": {"isRejected": False},
+            "after": {"isRejected": True},
+        },
+    )
+    session.commit()
+    return get_review_batch_groups(session, batch_id=batch.id)
+
+
+def restore_group_image_rejection(
+    session: Session,
+    *,
+    group_id: UUID,
+    image_id: UUID,
+) -> ReviewBatchGroupsState:
+    group, batch = _review_group_and_batch(session, group_id=group_id)
+    membership = _membership_in_group(
+        session,
+        batch=batch,
+        group_id=group.id,
+        image_id=image_id,
+    )
+    if not membership.is_rejected:
+        return get_review_batch_groups(session, batch_id=batch.id)
+
+    if membership.is_duplicate and membership.duplicate_of_image_id is not None:
+        master = _membership_in_group(
+            session,
+            batch=batch,
+            group_id=group.id,
+            image_id=membership.duplicate_of_image_id,
+        )
+        if master.is_rejected:
+            raise ReviewEditConflictError(
+                code=IMAGE_REJECTION_DUPLICATE_MASTER_REJECTED,
+                message=(
+                    "Restore or replace the duplicate master before restoring "
+                    "this image."
+                ),
+            )
+
+    membership.is_rejected = False
+    _normalize_batch_groups(session, batch=batch)
+    _write_review_event(
+        session,
+        batch=batch,
+        action_type="restore_rejection",
+        group_id=group.id,
+        image_id=image_id,
+        payload={
+            "groupId": str(group.id),
+            "imageId": str(image_id),
+            "before": {"isRejected": True},
+            "after": {"isRejected": False},
         },
     )
     session.commit()
@@ -662,6 +818,7 @@ def _manual_membership(
     group_id: UUID,
     image_id: UUID,
     position: int,
+    is_rejected: bool = False,
 ) -> ProductGroupImage:
     return ProductGroupImage(
         organization_id=batch.organization_id,
@@ -672,8 +829,31 @@ def _manual_membership(
         membership_source=MEMBERSHIP_SOURCE_MANUAL_REVIEW,
         membership_confidence=None,
         is_duplicate=False,
+        is_rejected=is_rejected,
         duplicate_of_image_id=None,
     )
+
+
+def _has_active_duplicates(
+    session: Session,
+    *,
+    batch: UploadBatch,
+    group_id: UUID,
+    master_image_id: UUID,
+) -> bool:
+    duplicate_image_id = session.scalar(
+        select(ProductGroupImage.image_id)
+        .where(
+            ProductGroupImage.organization_id == batch.organization_id,
+            ProductGroupImage.batch_id == batch.id,
+            ProductGroupImage.group_id == group_id,
+            ProductGroupImage.is_duplicate.is_(True),
+            ProductGroupImage.is_rejected.is_(False),
+            ProductGroupImage.duplicate_of_image_id == master_image_id,
+        )
+        .limit(1)
+    )
+    return duplicate_image_id is not None
 
 
 def _next_group_position(
@@ -746,31 +926,52 @@ def _normalize_batch_groups(session: Session, *, batch: UploadBatch) -> None:
         groups_by_id[group.id] = group
         rows_by_group_id.setdefault(group.id, []).append((membership, image))
 
-    for group_id, membership_rows in rows_by_group_id.items():
-        group = groups_by_id[group_id]
-        ordered_rows = sorted(
+    ordered_rows_by_group_id = {
+        group_id: sorted(
             membership_rows,
             key=lambda row: row[1].upload_order,
         )
+        for group_id, membership_rows in rows_by_group_id.items()
+    }
+
+    # Vacate every final position before compacting to satisfy the immediate
+    # unique constraint on (group_id, position).
+    for ordered_rows in ordered_rows_by_group_id.values():
+        temporary_start = max(
+            membership.position for membership, _ in ordered_rows
+        ) + 1
+        for offset, (membership, _) in enumerate(ordered_rows):
+            membership.position = temporary_start + offset
+    session.flush()
+
+    for group_id, ordered_rows in ordered_rows_by_group_id.items():
+        group = groups_by_id[group_id]
         for position, (membership, _) in enumerate(ordered_rows):
             membership.position = position
-
         valid_cover_ids = {
             membership.image_id
             for membership, _ in ordered_rows
-            if not membership.is_duplicate
+            if not membership.is_duplicate and not membership.is_rejected
         }
         if group.cover_image_id not in valid_cover_ids:
-            group.cover_image_id = _first_non_duplicate_image_id(ordered_rows)
+            group.cover_image_id = _first_active_non_duplicate_image_id(
+                ordered_rows
+            )
+    session.flush()
+    reconcile_batch_group_categories(
+        session,
+        batch_id=batch.id,
+        organization_id=batch.organization_id,
+    )
 
 
-def _first_non_duplicate_image_id(
+def _first_active_non_duplicate_image_id(
     rows: list[tuple[ProductGroupImage, ImageAsset]],
 ) -> UUID | None:
     for membership, _ in rows:
-        if not membership.is_duplicate:
+        if not membership.is_duplicate and not membership.is_rejected:
             return membership.image_id
-    return rows[0][0].image_id if rows else None
+    return None
 
 
 def _write_review_event(

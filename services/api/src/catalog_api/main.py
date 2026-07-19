@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
@@ -13,6 +15,14 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from catalog_api.approved_group_exports import (
+    ApprovedGroupsBatchNotFoundError,
+    ApprovedGroupsBatchStateError,
+    ApprovedGroupsExportDisabledError,
+    ApprovedGroupsExportState,
+    ApprovedGroupsInvalidError,
+    get_approved_groups_export,
+)
 from catalog_api.category_suggestion_providers import (
     CategorySuggestionProvider,
     get_category_suggestion_provider,
@@ -44,6 +54,20 @@ from catalog_api.local_batches import (
     LocalImageNotFoundError,
 )
 from catalog_api.models import Category
+from catalog_api.multimodal_comparison import (
+    MultimodalComparisonBatchNotFoundError,
+    MultimodalComparisonClaimLostError,
+    MultimodalComparisonConfigurationError,
+    MultimodalComparisonExecutionError,
+    MultimodalComparisonInProgressError,
+    MultimodalComparisonNotAllowedError,
+    run_multimodal_comparison,
+    validate_multimodal_comparison_configuration,
+)
+from catalog_api.multimodal_comparison_providers import (
+    MultimodalComparisonProvider,
+    get_multimodal_comparison_provider,
+)
 from catalog_api.processing_jobs import (
     ClassifyImageTaskPayload,
     GroupBatchTaskPayload,
@@ -83,6 +107,7 @@ from catalog_api.review_groups import (
 )
 from catalog_api.review_edits import (
     ReviewEditBatchNotFoundError,
+    ReviewEditConflictError,
     ReviewEditResourceNotFoundError,
     ReviewEditStateError,
     ReviewEditValidationError,
@@ -90,7 +115,9 @@ from catalog_api.review_edits import (
     create_review_group,
     merge_review_groups,
     move_image_to_group,
+    reject_group_image,
     remove_image_from_group,
+    restore_group_image_rejection,
     split_review_group,
     update_group_image_duplicate,
     update_review_group,
@@ -275,6 +302,7 @@ class ReviewGroupImageResponse(ApiModel):
     thumbnail_url: str = Field(serialization_alias="thumbnailUrl")
     position: int
     is_duplicate: bool = Field(serialization_alias="isDuplicate")
+    is_rejected: bool = Field(serialization_alias="isRejected")
     duplicate_of_image_id: UUID | None = Field(
         default=None,
         serialization_alias="duplicateOfImageId",
@@ -302,6 +330,14 @@ class ReviewGroupResponse(ApiModel):
         default=None,
         serialization_alias="approvedCategorySlug",
     )
+    category_suggestion_status: str | None = Field(
+        default=None,
+        serialization_alias="categorySuggestionStatus",
+    )
+    approved_category_source: str | None = Field(
+        default=None,
+        serialization_alias="approvedCategorySource",
+    )
     possible_existing_product_id: UUID | None = Field(
         default=None,
         serialization_alias="possibleExistingProductId",
@@ -319,6 +355,36 @@ class ReviewBatchGroupsResponse(ApiModel):
         serialization_alias="pipelineVersion",
     )
     groups: list[ReviewGroupResponse]
+
+
+class ApprovedGroupExportImageResponse(ApiModel):
+    image_id: UUID = Field(serialization_alias="imageId")
+    position: int
+    is_duplicate: bool = Field(serialization_alias="isDuplicate")
+    duplicate_of_image_id: UUID | None = Field(
+        serialization_alias="duplicateOfImageId",
+    )
+
+
+class ApprovedGroupExportResponse(ApiModel):
+    group_id: UUID = Field(serialization_alias="groupId")
+    approved_category_slug: str = Field(
+        serialization_alias="approvedCategorySlug",
+    )
+    suggested_category_slug: str | None = Field(
+        serialization_alias="suggestedCategorySlug",
+    )
+    cover_image_id: UUID = Field(serialization_alias="coverImageId")
+    confidence: float | None
+    images: list[ApprovedGroupExportImageResponse]
+
+
+class ApprovedGroupsExportResponse(ApiModel):
+    batch_id: UUID = Field(serialization_alias="batchId")
+    organization_id: UUID = Field(serialization_alias="organizationId")
+    status: Literal["approved"]
+    pipeline_version: str = Field(serialization_alias="pipelineVersion")
+    groups: list[ApprovedGroupExportResponse]
 
 
 class ReviewCategoryResponse(ApiModel):
@@ -419,7 +485,13 @@ def _allowed_web_origins() -> list[str]:
     return [origin.strip() for origin in configured_origins.split(",") if origin.strip()]
 
 
-app = FastAPI(title="Catalog Classifier API")
+@asynccontextmanager
+async def _app_lifespan(_: FastAPI) -> AsyncIterator[None]:
+    validate_multimodal_comparison_configuration()
+    yield
+
+
+app = FastAPI(title="Catalog Classifier API", lifespan=_app_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_web_origins(),
@@ -555,6 +627,36 @@ def _review_batch_not_ready() -> HTTPException:
     )
 
 
+def _approved_groups_export_disabled() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "code": "approved_groups_export_disabled",
+            "message": "Approved group export is not enabled.",
+        },
+    )
+
+
+def _approved_groups_batch_not_approved() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "batch_not_approved",
+            "message": "Approved groups are only available for approved batches.",
+        },
+    )
+
+
+def _approved_groups_invalid() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "approved_groups_invalid",
+            "message": "The approved group export is internally inconsistent.",
+        },
+    )
+
+
 def _review_edit_not_found(message: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
@@ -585,6 +687,16 @@ def _review_edit_state_error(message: str) -> HTTPException:
     )
 
 
+def _review_edit_conflict(*, code: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": code,
+            "message": message,
+        },
+    )
+
+
 def _review_approval_state_error(message: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
@@ -592,6 +704,28 @@ def _review_approval_state_error(message: str) -> HTTPException:
             "code": "review_approval_not_allowed",
             "message": message,
         },
+    )
+
+
+def _multimodal_comparison_conflict(
+    *,
+    code: str,
+    message: str,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": code, "message": message},
+    )
+
+
+def _multimodal_comparison_error(
+    *,
+    code: str,
+    message: str,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={"code": code, "message": message},
     )
 
 
@@ -739,6 +873,8 @@ def _review_batch_groups_response(
                 cover_image_id=group.cover_image_id,
                 suggested_category_slug=group.suggested_category_slug,
                 approved_category_slug=group.approved_category_slug,
+                category_suggestion_status=group.category_suggestion_status,
+                approved_category_source=group.approved_category_source,
                 possible_existing_product_id=group.possible_existing_product_id,
                 warnings=group.warnings,
                 images=[
@@ -749,9 +885,40 @@ def _review_batch_groups_response(
                         thumbnail_url=image.thumbnail_url,
                         position=image.position,
                         is_duplicate=image.is_duplicate,
+                        is_rejected=image.is_rejected,
                         duplicate_of_image_id=image.duplicate_of_image_id,
                         membership_source=image.membership_source,
                         membership_confidence=image.membership_confidence,
+                    )
+                    for image in group.images
+                ],
+            )
+            for group in snapshot.groups
+        ],
+    )
+
+
+def _approved_groups_export_response(
+    snapshot: ApprovedGroupsExportState,
+) -> ApprovedGroupsExportResponse:
+    return ApprovedGroupsExportResponse(
+        batch_id=snapshot.batch_id,
+        organization_id=snapshot.organization_id,
+        status="approved",
+        pipeline_version=snapshot.pipeline_version,
+        groups=[
+            ApprovedGroupExportResponse(
+                group_id=group.group_id,
+                approved_category_slug=group.approved_category_slug,
+                suggested_category_slug=group.suggested_category_slug,
+                cover_image_id=group.cover_image_id,
+                confidence=group.confidence,
+                images=[
+                    ApprovedGroupExportImageResponse(
+                        image_id=image.image_id,
+                        position=image.position,
+                        is_duplicate=image.is_duplicate,
+                        duplicate_of_image_id=image.duplicate_of_image_id,
                     )
                     for image in group.images
                 ],
@@ -1091,6 +1258,91 @@ def get_durable_upload_batch_groups(
     return _review_batch_groups_response(snapshot)
 
 
+@app.get(
+    "/v1/upload-batches/{batch_id}/approved-groups",
+    response_model=ApprovedGroupsExportResponse,
+)
+def get_durable_approved_groups_export(
+    batch_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> ApprovedGroupsExportResponse:
+    try:
+        snapshot = get_approved_groups_export(session, batch_id=batch_id)
+    except ApprovedGroupsExportDisabledError as error:
+        raise _approved_groups_export_disabled() from error
+    except ApprovedGroupsBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ApprovedGroupsBatchStateError as error:
+        raise _approved_groups_batch_not_approved() from error
+    except ApprovedGroupsInvalidError as error:
+        raise _approved_groups_invalid() from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to load approved groups."
+        ) from error
+
+    return _approved_groups_export_response(snapshot)
+
+
+@app.post(
+    "/v1/upload-batches/{batch_id}/run-multimodal-comparison",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def run_durable_upload_batch_multimodal_comparison(
+    batch_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+    storage: Annotated[WorkerStorage, Depends(get_worker_storage)],
+    provider: Annotated[
+        MultimodalComparisonProvider,
+        Depends(get_multimodal_comparison_provider),
+    ],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = run_multimodal_comparison(
+            session,
+            batch_id=batch_id,
+            storage=storage,
+            provider=provider,
+        )
+    except MultimodalComparisonBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except MultimodalComparisonInProgressError as error:
+        raise _multimodal_comparison_conflict(
+            code="multimodal_comparison_in_progress",
+            message="A multimodal comparison is already running for this batch.",
+        ) from error
+    except MultimodalComparisonClaimLostError as error:
+        raise _multimodal_comparison_conflict(
+            code="multimodal_comparison_claim_lost",
+            message="A newer multimodal comparison attempt owns this batch.",
+        ) from error
+    except MultimodalComparisonNotAllowedError as error:
+        raise _multimodal_comparison_conflict(
+            code="multimodal_comparison_not_allowed",
+            message=str(error),
+        ) from error
+    except MultimodalComparisonConfigurationError as error:
+        raise _multimodal_comparison_error(
+            code="multimodal_comparison_configuration_invalid",
+            message=str(error),
+        ) from error
+    except MultimodalComparisonExecutionError as error:
+        raise _multimodal_comparison_error(
+            code=error.error_code,
+            message=error.message,
+        ) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _multimodal_comparison_error(
+            code="database_error",
+            message="Unable to run multimodal comparison.",
+        ) from error
+
+    return _review_batch_groups_response(snapshot)
+
+
 @app.post(
     "/v1/upload-batches/{batch_id}/groups",
     response_model=ReviewBatchGroupsResponse,
@@ -1310,12 +1562,93 @@ def update_durable_review_group_image(
         raise _review_edit_not_found(str(error)) from error
     except ReviewEditValidationError as error:
         raise _invalid_review_edit(str(error)) from error
+    except ReviewEditConflictError as error:
+        raise _review_edit_conflict(
+            code=error.code,
+            message=str(error),
+        ) from error
     except ReviewEditStateError as error:
         raise _review_edit_state_error(str(error)) from error
     except SQLAlchemyError as error:
         session.rollback()
         raise _upload_batch_database_error(
             "Unable to update review group image."
+        ) from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.post(
+    "/v1/groups/{group_id}/images/{image_id}/reject",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def reject_durable_review_group_image(
+    group_id: UUID,
+    image_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = reject_group_image(
+            session,
+            group_id=group_id,
+            image_id=image_id,
+        )
+    except ReviewEditBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewEditResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewEditValidationError as error:
+        raise _invalid_review_edit(str(error)) from error
+    except ReviewEditConflictError as error:
+        raise _review_edit_conflict(
+            code=error.code,
+            message=str(error),
+        ) from error
+    except ReviewEditStateError as error:
+        raise _review_edit_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to reject review group image."
+        ) from error
+
+    return _review_batch_groups_response(snapshot)
+
+
+@app.post(
+    "/v1/groups/{group_id}/images/{image_id}/restore-rejection",
+    response_model=ReviewBatchGroupsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def restore_durable_review_group_image_rejection(
+    group_id: UUID,
+    image_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> ReviewBatchGroupsResponse:
+    try:
+        snapshot = restore_group_image_rejection(
+            session,
+            group_id=group_id,
+            image_id=image_id,
+        )
+    except ReviewEditBatchNotFoundError as error:
+        raise _upload_batch_not_found() from error
+    except ReviewEditResourceNotFoundError as error:
+        raise _review_edit_not_found(str(error)) from error
+    except ReviewEditValidationError as error:
+        raise _invalid_review_edit(str(error)) from error
+    except ReviewEditConflictError as error:
+        raise _review_edit_conflict(
+            code=error.code,
+            message=str(error),
+        ) from error
+    except ReviewEditStateError as error:
+        raise _review_edit_state_error(str(error)) from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to restore review group image rejection."
         ) from error
 
     return _review_batch_groups_response(snapshot)

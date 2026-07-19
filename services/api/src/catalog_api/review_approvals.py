@@ -7,7 +7,17 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from catalog_api.models import ProductGroup, ReviewEvent, UploadBatch
+from catalog_api.group_category_reconciliation import (
+    APPROVED_CATEGORY_SOURCE_MACHINE,
+    APPROVED_CATEGORY_SOURCE_REVIEWER,
+    active_global_leaf_category,
+)
+from catalog_api.models import (
+    ProductGroup,
+    ProductGroupImage,
+    ReviewEvent,
+    UploadBatch,
+)
 from catalog_api.review_groups import ReviewBatchGroupsState, get_review_batch_groups
 from catalog_api.upload_batches import DEFAULT_ORGANIZATION_ID
 
@@ -53,6 +63,36 @@ def approve_review_group(
         raise ReviewApprovalStateError(
             "Group approval requires an approved category."
         )
+    if group.approved_category_source not in {
+        APPROVED_CATEGORY_SOURCE_MACHINE,
+        APPROVED_CATEGORY_SOURCE_REVIEWER,
+    }:
+        raise ReviewApprovalStateError(
+            "Group approval requires a valid approved category source."
+        )
+    approved_category = active_global_leaf_category(
+        session,
+        category_id=group.approved_category_id,
+    )
+    if approved_category is None:
+        raise ReviewApprovalStateError(
+            "Group approval requires an active leaf approved category."
+        )
+    active_image_id = session.scalar(
+        select(ProductGroupImage.image_id)
+        .where(
+            ProductGroupImage.organization_id == batch.organization_id,
+            ProductGroupImage.batch_id == batch.id,
+            ProductGroupImage.group_id == group.id,
+            ProductGroupImage.is_rejected.is_(False),
+            ProductGroupImage.is_duplicate.is_(False),
+        )
+        .limit(1)
+    )
+    if active_image_id is None:
+        raise ReviewApprovalStateError(
+            "Group approval requires at least one active non-duplicate image."
+        )
 
     group.status = "approved"
     group.approved_at = datetime.now(UTC)
@@ -63,6 +103,9 @@ def approve_review_group(
         group_id=group.id,
         payload={
             "groupId": str(group.id),
+            "approvedCategoryId": str(approved_category.id),
+            "approvedCategorySlug": approved_category.slug,
+            "categorySource": group.approved_category_source,
             "approvedAt": group.approved_at.isoformat(),
         },
     )

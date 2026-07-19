@@ -5,6 +5,7 @@ export type ReviewGroupImage = {
   thumbnailUrl: string;
   position: number;
   isDuplicate: boolean;
+  isRejected: boolean;
   duplicateOfImageId: string | null;
   membershipSource: string;
   membershipConfidence: number | null;
@@ -17,6 +18,12 @@ export type ReviewGroup = {
   coverImageId: string | null;
   suggestedCategorySlug: string | null;
   approvedCategorySlug: string | null;
+  categorySuggestionStatus: "pending" | "ready" | "unavailable" | null;
+  approvedCategorySource:
+    | "machine_suggestion"
+    | "reviewer_selection"
+    | "reviewer_cleared"
+    | null;
   possibleExistingProductId: string | null;
   warnings: string[];
   images: ReviewGroupImage[];
@@ -38,10 +45,19 @@ export type ReviewCategory = {
 };
 
 type ApiErrorBody = {
-  detail?: string | { message?: string };
+  detail?: string | { code?: string; message?: string };
 };
 
-export class ReviewBatchError extends Error {}
+export class ReviewBatchError extends Error {
+  constructor(
+    message: string,
+    readonly status: number | null = null,
+    readonly code: string | null = null,
+  ) {
+    super(message);
+    this.name = "ReviewBatchError";
+  }
+}
 
 function apiBaseUrl(): string {
   return process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -55,14 +71,20 @@ function apiUrl(path: string, baseUrl = apiBaseUrl()): string {
 async function responseError(response: Response): Promise<ReviewBatchError> {
   const body = (await response.json().catch(() => null)) as ApiErrorBody | null;
   let message = "The backend rejected the request.";
+  let code: string | null = null;
 
   if (typeof body?.detail === "string") {
     message = body.detail;
-  } else if (body?.detail && typeof body.detail.message === "string") {
-    message = body.detail.message;
+  } else if (body?.detail) {
+    if (typeof body.detail.message === "string") {
+      message = body.detail.message;
+    }
+    if (typeof body.detail.code === "string") {
+      code = body.detail.code;
+    }
   }
 
-  return new ReviewBatchError(message);
+  return new ReviewBatchError(message, response.status, code);
 }
 
 export async function loadReviewBatchGroups(
@@ -92,6 +114,28 @@ export async function loadReviewCategories(
   }
 
   return (await response.json()) as ReviewCategory[];
+}
+
+export async function runMultimodalComparison(
+  batchId: string,
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<ReviewBatchGroups> {
+  const response = await fetchImplementation(
+    apiUrl(
+      `/v1/upload-batches/${batchId}/run-multimodal-comparison`,
+      baseUrl,
+    ),
+    {
+      method: "POST",
+    },
+  );
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as ReviewBatchGroups;
 }
 
 export async function createReviewGroup(
@@ -233,6 +277,49 @@ export async function updateReviewImageDuplicate(
         isDuplicate: duplicateOfImageId !== null,
         duplicateOfImageId,
       }),
+    },
+  );
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as ReviewBatchGroups;
+}
+
+export async function rejectReviewImage(
+  groupId: string,
+  imageId: string,
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<ReviewBatchGroups> {
+  const response = await fetchImplementation(
+    apiUrl(`/v1/groups/${groupId}/images/${imageId}/reject`, baseUrl),
+    {
+      method: "POST",
+    },
+  );
+
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+
+  return (await response.json()) as ReviewBatchGroups;
+}
+
+export async function restoreReviewImageRejection(
+  groupId: string,
+  imageId: string,
+  fetchImplementation: typeof fetch = fetch,
+  baseUrl = apiBaseUrl(),
+): Promise<ReviewBatchGroups> {
+  const response = await fetchImplementation(
+    apiUrl(
+      `/v1/groups/${groupId}/images/${imageId}/restore-rejection`,
+      baseUrl,
+    ),
+    {
+      method: "POST",
     },
   );
 

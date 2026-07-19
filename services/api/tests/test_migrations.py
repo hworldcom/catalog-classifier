@@ -236,6 +236,8 @@ def test_upgrade_matches_models_and_supports_ordered_images(
             constraint["name"]
             for constraint in inspector.get_check_constraints("product_groups")
         } == {
+            "ck_product_groups_approved_category_source",
+            "ck_product_groups_approved_category_source_consistency",
             "ck_product_groups_confidence_range",
             "ck_product_groups_status",
         }
@@ -506,6 +508,140 @@ def test_upgrade_matches_models_and_supports_ordered_images(
             assert compare_metadata(context, Base.metadata) == []
     finally:
         engine.dispose()
+
+
+def test_image_rejection_migration_backfills_existing_memberships(
+    empty_database_url: str,
+) -> None:
+    config = _alembic_config(empty_database_url)
+    command.upgrade(config, "0007_grouping_review")
+    engine = create_engine(empty_database_url)
+
+    try:
+        with engine.begin() as connection:
+            batch_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO upload_batches (organization_id)
+                    VALUES (:organization_id)
+                    RETURNING id
+                    """
+                ),
+                {"organization_id": DEFAULT_ORGANIZATION_ID},
+            ).scalar_one()
+            image_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO image_assets (
+                        organization_id,
+                        batch_id,
+                        original_object_key,
+                        original_filename,
+                        upload_order,
+                        mime_type,
+                        size_bytes
+                    )
+                    VALUES (
+                        :organization_id,
+                        :batch_id,
+                        'qa/0022/existing.jpg',
+                        'existing.jpg',
+                        0,
+                        'image/jpeg',
+                        100
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "organization_id": DEFAULT_ORGANIZATION_ID,
+                    "batch_id": batch_id,
+                },
+            ).scalar_one()
+            group_id = connection.execute(
+                text(
+                    """
+                    INSERT INTO product_groups (
+                        organization_id,
+                        batch_id,
+                        cover_image_id
+                    )
+                    VALUES (
+                        :organization_id,
+                        :batch_id,
+                        :image_id
+                    )
+                    RETURNING id
+                    """
+                ),
+                {
+                    "organization_id": DEFAULT_ORGANIZATION_ID,
+                    "batch_id": batch_id,
+                    "image_id": image_id,
+                },
+            ).scalar_one()
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO product_group_images (
+                        organization_id,
+                        batch_id,
+                        group_id,
+                        image_id,
+                        position,
+                        membership_source
+                    )
+                    VALUES (
+                        :organization_id,
+                        :batch_id,
+                        :group_id,
+                        :image_id,
+                        0,
+                        'singleton'
+                    )
+                    """
+                ),
+                {
+                    "organization_id": DEFAULT_ORGANIZATION_ID,
+                    "batch_id": batch_id,
+                    "group_id": group_id,
+                    "image_id": image_id,
+                },
+            )
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
+    upgraded_engine = create_engine(empty_database_url)
+    try:
+        columns = {
+            column["name"]: column
+            for column in inspect(upgraded_engine).get_columns(
+                "product_group_images"
+            )
+        }
+        assert columns["is_rejected"]["nullable"] is False
+        assert columns["is_rejected"]["default"] in {
+            "false",
+            "false::boolean",
+        }
+        with upgraded_engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    """
+                    SELECT is_rejected
+                    FROM product_group_images
+                    WHERE group_id = :group_id
+                      AND image_id = :image_id
+                    """
+                ),
+                {
+                    "group_id": group_id,
+                    "image_id": image_id,
+                },
+            ).scalar_one() is False
+    finally:
+        upgraded_engine.dispose()
 
 
 def test_constraints_reject_cross_organization_image_relationships(
@@ -1262,6 +1398,139 @@ def test_grouping_schema_constraints_and_review_tables(
                         "group_id": second_group_id,
                         "image_id": image_ids[0],
                     },
+                )
+    finally:
+        engine.dispose()
+
+
+def test_approved_category_source_migration_backfills_and_constrains_state(
+    empty_database_url: str,
+) -> None:
+    config = _alembic_config(empty_database_url)
+    command.upgrade(config, "0008_image_rejection")
+    engine = create_engine(empty_database_url)
+
+    with engine.begin() as connection:
+        batch_id = connection.execute(
+            text(
+                """
+                INSERT INTO upload_batches (
+                    organization_id,
+                    status,
+                    pipeline_version
+                )
+                VALUES (
+                    :organization_id,
+                    'review_required',
+                    '2026-06-01'
+                )
+                RETURNING id
+                """
+            ),
+            {"organization_id": DEFAULT_ORGANIZATION_ID},
+        ).scalar_one()
+        category_id = connection.execute(
+            text("SELECT id FROM categories WHERE slug = 't-shirts'")
+        ).scalar_one()
+        group_id = connection.execute(
+            text(
+                """
+                INSERT INTO product_groups (
+                    organization_id,
+                    batch_id,
+                    approved_category_id
+                )
+                VALUES (
+                    :organization_id,
+                    :batch_id,
+                    :category_id
+                )
+                RETURNING id
+                """
+            ),
+            {
+                "organization_id": DEFAULT_ORGANIZATION_ID,
+                "batch_id": batch_id,
+                "category_id": category_id,
+            },
+        ).scalar_one()
+        empty_group_id = connection.execute(
+            text(
+                """
+                INSERT INTO product_groups (organization_id, batch_id)
+                VALUES (:organization_id, :batch_id)
+                RETURNING id
+                """
+            ),
+            {
+                "organization_id": DEFAULT_ORGANIZATION_ID,
+                "batch_id": batch_id,
+            },
+        ).scalar_one()
+
+    engine.dispose()
+    command.upgrade(config, "head")
+    engine = create_engine(empty_database_url)
+
+    try:
+        with engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    """
+                    SELECT approved_category_source
+                    FROM product_groups
+                    WHERE id = :group_id
+                    """
+                ),
+                {"group_id": group_id},
+            ).scalar_one() == "reviewer_selection"
+            assert connection.execute(
+                text(
+                    """
+                    SELECT approved_category_source
+                    FROM product_groups
+                    WHERE id = :group_id
+                    """
+                ),
+                {"group_id": empty_group_id},
+            ).scalar_one_or_none() is None
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE product_groups
+                    SET approved_category_source = 'machine_suggestion'
+                    WHERE id = :group_id
+                    """
+                ),
+                {"group_id": empty_group_id},
+            )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE product_groups
+                        SET approved_category_source = 'reviewer_cleared'
+                        WHERE id = :group_id
+                        """
+                    ),
+                    {"group_id": group_id},
+                )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        UPDATE product_groups
+                        SET approved_category_source = 'reviewer_selection'
+                        WHERE id = :group_id
+                        """
+                    ),
+                    {"group_id": empty_group_id},
                 )
     finally:
         engine.dispose()

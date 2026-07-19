@@ -26,7 +26,7 @@ export default function ProcessingBatch({
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isStarting, setIsStarting] = useState(false);
-  const [hasStartedProcessing, setHasStartedProcessing] = useState(false);
+  const [pollCycle, setPollCycle] = useState(0);
   const [failedThumbnailKeys, setFailedThumbnailKeys] = useState<Set<string>>(
     () => new Set(),
   );
@@ -42,7 +42,6 @@ export default function ProcessingBatch({
           return;
         }
         setSnapshot(loadedSnapshot);
-        setHasStartedProcessing(loadedSnapshot.status !== "queued");
         setError(null);
       } catch (loadError) {
         if (isCurrent) {
@@ -61,12 +60,10 @@ export default function ProcessingBatch({
     };
   }, [batchId]);
 
+  const batchStatus = snapshot?.status;
+
   useEffect(() => {
-    if (
-      !snapshot ||
-      !hasStartedProcessing ||
-      isProcessingBatchTerminal(snapshot)
-    ) {
+    if (batchStatus !== "processing") {
       return;
     }
 
@@ -82,6 +79,10 @@ export default function ProcessingBatch({
         if (isCurrent) {
           setError(errorMessage(pollError, "Processing state could not be refreshed."));
         }
+      } finally {
+        if (isCurrent) {
+          setPollCycle((currentCycle) => currentCycle + 1);
+        }
       }
     }, pollIntervalMs);
 
@@ -89,7 +90,7 @@ export default function ProcessingBatch({
       isCurrent = false;
       window.clearTimeout(timeoutId);
     };
-  }, [batchId, hasStartedProcessing, pollIntervalMs, snapshot]);
+  }, [batchId, batchStatus, pollCycle, pollIntervalMs]);
 
   async function handleStartProcessing() {
     setIsStarting(true);
@@ -97,7 +98,6 @@ export default function ProcessingBatch({
     try {
       const startedSnapshot = await startUploadBatchProcessing(batchId);
       setSnapshot(startedSnapshot);
-      setHasStartedProcessing(true);
     } catch (startError) {
       setError(errorMessage(startError, "Processing could not be started."));
     } finally {
@@ -137,6 +137,11 @@ export default function ProcessingBatch({
   }
 
   const isTerminal = isProcessingBatchTerminal(snapshot);
+  const statusMessage = processingStatusMessage(snapshot.status, isTerminal);
+  const reviewNavigation = reviewNavigationFor(
+    snapshot.status,
+    snapshot.batchId,
+  );
 
   return (
     <main className="review-shell">
@@ -177,18 +182,8 @@ export default function ProcessingBatch({
 
       <section className="selection-toolbar" aria-label="Processing controls">
         <div>
-          <strong>
-            {isTerminal
-              ? "Processing reached terminal image states"
-              : snapshot.status === "queued"
-                ? "Batch is queued"
-                : "Processing is running"}
-          </strong>
-          <span>
-            {snapshot.status === "queued"
-              ? "Start processing when you are ready to run image processing and classification."
-              : "The page polls the backend processing snapshot until every visible image is terminal."}
-          </span>
+          <strong>{statusMessage.heading}</strong>
+          <span>{statusMessage.description}</span>
         </div>
         {snapshot.status === "queued" ? (
           <button
@@ -198,6 +193,14 @@ export default function ProcessingBatch({
           >
             {isStarting ? "Starting..." : "Start processing"}
           </button>
+        ) : null}
+        {reviewNavigation ? (
+          <a
+            className="processing-review-link"
+            href={reviewNavigation.href}
+          >
+            {reviewNavigation.label}
+          </a>
         ) : null}
       </section>
 
@@ -345,6 +348,83 @@ function statusClass(status: string): string {
     return "failed";
   }
   return "pending";
+}
+
+function processingStatusMessage(
+  status: string,
+  imageJobsAreTerminal: boolean,
+): { heading: string; description: string } {
+  if (status === "queued") {
+    return {
+      heading: "Batch is queued",
+      description:
+        "Start processing when you are ready to run image processing and classification.",
+    };
+  }
+  if (status === "processing" && imageJobsAreTerminal) {
+    return {
+      heading: "Preparing review groups",
+      description:
+        "Image processing is complete. Preparing review groups...",
+    };
+  }
+  if (status === "processing") {
+    return {
+      heading: "Processing is running",
+      description:
+        "The page polls the backend processing snapshot until review groups are ready.",
+    };
+  }
+  if (status === "review_required") {
+    return {
+      heading: "Review groups are ready",
+      description:
+        "Open the durable review page when you are ready to inspect the proposed groups.",
+    };
+  }
+  if (status === "approved") {
+    return {
+      heading: "Review is approved",
+      description:
+        "The approved review remains available as a read-only record.",
+    };
+  }
+  if (status === "failed") {
+    return {
+      heading: "Processing stopped",
+      description:
+        "Processing stopped before review groups could be prepared.",
+    };
+  }
+  if (status === "cancelled") {
+    return {
+      heading: "Processing was cancelled",
+      description: "Processing was cancelled.",
+    };
+  }
+  return {
+    heading: "Processing state is unavailable",
+    description: `The batch reported an unsupported status: ${status}.`,
+  };
+}
+
+function reviewNavigationFor(
+  status: string,
+  batchId: string,
+): { href: string; label: string } | null {
+  if (status === "review_required") {
+    return {
+      href: `/admin/review/${batchId}`,
+      label: "Review groups",
+    };
+  }
+  if (status === "approved") {
+    return {
+      href: `/admin/review/${batchId}`,
+      label: "View approved review",
+    };
+  }
+  return null;
 }
 
 function errorMessage(error: unknown, fallback: string): string {

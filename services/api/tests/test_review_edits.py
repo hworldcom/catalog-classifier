@@ -237,10 +237,71 @@ async def test_patch_review_group_updates_cover_and_approved_category(
     group = _group_by_id(category_response.json(), fixture.group_ids[0])
     assert group["coverImageId"] == str(fixture.image_ids[1])
     assert group["approvedCategorySlug"] == "trousers"
+    assert group["approvedCategorySource"] == "reviewer_selection"
     with Session(migrated_engine) as session:
+        stored_group = session.get(ProductGroup, fixture.group_ids[0])
+        assert stored_group is not None
+        assert stored_group.approved_category_source == "reviewer_selection"
         assert _review_event_actions(session, fixture.batch_id) == [
             "update_group",
             "update_group",
+        ]
+
+
+async def test_patch_review_group_records_explicit_clear_as_reviewer_intent(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+) -> None:
+    with Session(migrated_engine) as session:
+        fixture = _create_review_edit_fixture(session)
+
+    response = await database_client.patch(
+        f"/v1/groups/{fixture.group_ids[0]}",
+        json={"approvedCategoryId": None},
+    )
+
+    assert response.status_code == 200
+    group = _group_by_id(response.json(), fixture.group_ids[0])
+    assert group["approvedCategorySlug"] is None
+    assert group["approvedCategorySource"] == "reviewer_cleared"
+    with Session(migrated_engine) as session:
+        stored_group = session.get(ProductGroup, fixture.group_ids[0])
+        assert stored_group is not None
+        assert stored_group.approved_category_id is None
+        assert stored_group.approved_category_source == "reviewer_cleared"
+        assert _review_event_actions(session, fixture.batch_id) == [
+            "update_group"
+        ]
+
+
+async def test_saving_machine_prefill_records_reviewer_selection(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+) -> None:
+    with Session(migrated_engine) as session:
+        fixture = _create_review_edit_fixture(session)
+        category_id = fixture.category_ids_by_slug["t-shirts"]
+        group = session.get(ProductGroup, fixture.group_ids[0])
+        assert group is not None
+        group.approved_category_id = category_id
+        group.approved_category_source = "machine_suggestion"
+        session.commit()
+
+    response = await database_client.patch(
+        f"/v1/groups/{fixture.group_ids[0]}",
+        json={"approvedCategoryId": str(category_id)},
+    )
+
+    assert response.status_code == 200
+    group_body = _group_by_id(response.json(), fixture.group_ids[0])
+    assert group_body["approvedCategorySlug"] == "t-shirts"
+    assert group_body["approvedCategorySource"] == "reviewer_selection"
+    with Session(migrated_engine) as session:
+        stored_group = session.get(ProductGroup, fixture.group_ids[0])
+        assert stored_group is not None
+        assert stored_group.approved_category_source == "reviewer_selection"
+        assert _review_event_actions(session, fixture.batch_id) == [
+            "update_group"
         ]
 
 

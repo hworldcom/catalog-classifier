@@ -6,6 +6,9 @@ from uuid import UUID
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
+from catalog_api.group_category_reconciliation import (
+    evaluate_group_category_suggestion,
+)
 from catalog_api.models import (
     Category,
     ImageAsset,
@@ -34,6 +37,7 @@ class ReviewGroupImageState:
     thumbnail_url: str
     position: int
     is_duplicate: bool
+    is_rejected: bool
     duplicate_of_image_id: UUID | None
     membership_source: str
     membership_confidence: float | None
@@ -47,6 +51,8 @@ class ReviewGroupState:
     cover_image_id: UUID | None
     suggested_category_slug: str | None
     approved_category_slug: str | None
+    category_suggestion_status: str | None
+    approved_category_source: str | None
     possible_existing_product_id: UUID | None
     warnings: list[str]
     images: list[ReviewGroupImageState]
@@ -124,6 +130,16 @@ def get_review_batch_groups(
                     if group.approved_category_id is not None
                     else None
                 ),
+                category_suggestion_status=(
+                    None
+                    if group.status == "approved"
+                    else evaluate_group_category_suggestion(
+                        session,
+                        batch=batch,
+                        group=group,
+                    ).status
+                ),
+                approved_category_source=group.approved_category_source,
                 possible_existing_product_id=group.possible_existing_product_id,
                 warnings=[],
                 images=images_by_group_id.get(group.id, []),
@@ -180,6 +196,7 @@ def _review_images_by_group_id(
                 ),
                 position=membership.position,
                 is_duplicate=membership.is_duplicate,
+                is_rejected=membership.is_rejected,
                 duplicate_of_image_id=membership.duplicate_of_image_id,
                 membership_source=membership.membership_source,
                 membership_confidence=membership.membership_confidence,

@@ -30,6 +30,8 @@ from catalog_api.models import (
     ImageClassification,
     ImageEmbedding,
     ProcessingJob,
+    ProductGroup,
+    ProductGroupImage,
     UploadBatch,
 )
 from catalog_api.processing_jobs import (
@@ -817,6 +819,69 @@ async def test_classify_image_worker_persists_known_category_and_is_idempotent(
     assert redelivered_job.attempt_count == 1
     assert redelivered_batch is not None
     assert redelivered_batch.processed_file_count == 1
+
+
+async def test_classify_image_worker_reconciles_existing_review_group(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+    fake_worker_storage: FakeWorkerStorage,
+    fake_category_suggestion_provider: FakeCategorySuggestionProvider,
+) -> None:
+    inference_bytes = _jpeg_bytes(size=(320, 240))
+    with Session(migrated_engine) as session:
+        batch_id, image_id, inference_key = _create_processed_image_with_classify_job(
+            session
+        )
+        batch = session.get(UploadBatch, batch_id)
+        assert batch is not None
+        batch.status = "review_required"
+        group = ProductGroup(
+            organization_id=DEFAULT_ORGANIZATION_ID,
+            batch_id=batch.id,
+            status="proposed",
+            cover_image_id=image_id,
+        )
+        session.add(group)
+        session.flush()
+        group_id = group.id
+        session.add(
+            ProductGroupImage(
+                organization_id=DEFAULT_ORGANIZATION_ID,
+                batch_id=batch.id,
+                group_id=group.id,
+                image_id=image_id,
+                position=0,
+                membership_source="singleton",
+            )
+        )
+        session.commit()
+    fake_worker_storage.objects[inference_key] = StoredObject(
+        data=inference_bytes,
+        content_type=JPEG_CONTENT_TYPE,
+    )
+
+    response = await database_client.post(
+        "/internal/tasks/classify-image",
+        json={
+            "batchId": str(batch_id),
+            "imageId": str(image_id),
+            "pipelineVersion": PIPELINE_VERSION,
+        },
+    )
+
+    assert response.status_code == 200
+    with Session(migrated_engine) as session:
+        category = session.scalar(
+            select(Category).where(Category.slug == "t-shirts")
+        )
+        stored_group = session.get(ProductGroup, group_id)
+
+    assert category is not None
+    assert stored_group is not None
+    assert stored_group.status == "proposed"
+    assert stored_group.suggested_category_id == category.id
+    assert stored_group.approved_category_id == category.id
+    assert stored_group.approved_category_source == "machine_suggestion"
 
 
 @pytest.mark.parametrize(

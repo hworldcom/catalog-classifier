@@ -8,10 +8,13 @@ from itertools import combinations
 from math import sqrt
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from catalog_api.embedding_vectors import EMBEDDING_DIMENSIONS
+from catalog_api.group_category_reconciliation import (
+    reconcile_batch_group_categories,
+)
 from catalog_api.models import (
     ImageAsset,
     ImageClassification,
@@ -34,9 +37,13 @@ DECISION_DIFFERENT_PRODUCT = "different_product"
 DECISION_UNCERTAIN = "uncertain"
 DECISION_SOURCE_HEURISTIC = "heuristic"
 DECISION_SOURCE_EXACT_DUPLICATE = "exact_duplicate"
+DECISION_SOURCE_MULTIMODAL_MODEL = "multimodal_model"
 MEMBERSHIP_SOURCE_ENGINE = "engine"
 MEMBERSHIP_SOURCE_EXACT_DUPLICATE = "exact_duplicate"
 MEMBERSHIP_SOURCE_SINGLETON = "singleton"
+GROUPING_FAILED_ERROR_MESSAGE = (
+    "grouping_failed: The grouping task could not be completed."
+)
 
 
 class GroupingBatchNotFoundError(Exception):
@@ -162,6 +169,11 @@ def group_batch_task(
         )
     )
     if existing_group is not None or batch.status == "review_required":
+        reconcile_batch_group_categories(
+            session,
+            batch_id=batch.id,
+            organization_id=batch.organization_id,
+        )
         job.status = "completed"
         job.completed_at = job.completed_at or _utc_now()
         job.error_message = None
@@ -207,6 +219,11 @@ def group_batch_task(
         signals=signals,
         pair_decisions=pair_decisions,
     )
+    reconcile_batch_group_categories(
+        session,
+        batch_id=batch.id,
+        organization_id=batch.organization_id,
+    )
     batch.status = "review_required"
     job.status = "completed"
     job.completed_at = _utc_now()
@@ -219,6 +236,55 @@ def group_batch_task(
         job_status="completed",
         did_work=True,
     )
+
+
+def record_group_batch_terminal_failure(
+    session: Session,
+    *,
+    payload: GroupBatchTaskPayload,
+) -> bool:
+    job = session.scalar(
+        select(ProcessingJob)
+        .where(
+            ProcessingJob.batch_id == payload.batch_id,
+            ProcessingJob.image_id.is_(None),
+            ProcessingJob.organization_id == DEFAULT_ORGANIZATION_ID,
+            ProcessingJob.job_type == GROUP_BATCH_JOB_TYPE,
+            ProcessingJob.pipeline_version == payload.pipeline_version,
+            ProcessingJob.idempotency_key
+            == group_batch_idempotency_key(
+                batch_id=payload.batch_id,
+                pipeline_version=payload.pipeline_version,
+            ),
+        )
+        .with_for_update()
+    )
+    if job is None:
+        session.commit()
+        return False
+
+    batch = session.scalar(
+        select(UploadBatch)
+        .where(
+            UploadBatch.id == payload.batch_id,
+            UploadBatch.organization_id == DEFAULT_ORGANIZATION_ID,
+        )
+        .with_for_update()
+    )
+    if (
+        batch is None
+        or batch.status != "processing"
+        or job.status not in {"pending", "started"}
+    ):
+        session.commit()
+        return False
+
+    job.status = "failed"
+    job.completed_at = _utc_now()
+    job.error_message = GROUPING_FAILED_ERROR_MESSAGE
+    batch.status = "failed"
+    session.commit()
+    return True
 
 
 def _load_image_signals(
@@ -555,6 +621,66 @@ def _persist_product_groups(
                     duplicate_of_image_id=duplicate_of_image_id,
                 )
             )
+
+
+def rebuild_product_groups_from_assessments(
+    session: Session,
+    *,
+    batch: UploadBatch,
+    pipeline_version: str,
+) -> None:
+    """Replace untouched engine groups using the persisted pair decisions."""
+    signals = _load_image_signals(
+        session,
+        batch_id=batch.id,
+        pipeline_version=pipeline_version,
+    )
+    assessments = session.scalars(
+        select(PairAssessment).where(
+            PairAssessment.organization_id == batch.organization_id,
+            PairAssessment.batch_id == batch.id,
+            PairAssessment.pipeline_version == pipeline_version,
+        )
+    ).all()
+    pair_decisions = {
+        (assessment.image_a_id, assessment.image_b_id): _PairDecision(
+            image_a_id=assessment.image_a_id,
+            image_b_id=assessment.image_b_id,
+            decision=assessment.decision,
+            confidence=assessment.confidence,
+            decision_source=assessment.decision_source,
+            embedding_similarity=assessment.embedding_similarity,
+            phash_distance=assessment.phash_distance,
+            category_match=assessment.category_match,
+            upload_order_distance=assessment.upload_order_distance or 0,
+        )
+        for assessment in assessments
+    }
+
+    session.execute(
+        delete(ProductGroupImage).where(
+            ProductGroupImage.organization_id == batch.organization_id,
+            ProductGroupImage.batch_id == batch.id,
+        )
+    )
+    session.execute(
+        delete(ProductGroup).where(
+            ProductGroup.organization_id == batch.organization_id,
+            ProductGroup.batch_id == batch.id,
+        )
+    )
+    session.flush()
+    _persist_product_groups(
+        session,
+        batch=batch,
+        signals=signals,
+        pair_decisions=pair_decisions,
+    )
+    reconcile_batch_group_categories(
+        session,
+        batch_id=batch.id,
+        organization_id=batch.organization_id,
+    )
 
 
 def _build_groups(

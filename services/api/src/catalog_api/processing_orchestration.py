@@ -19,7 +19,10 @@ from catalog_api.image_embedding_providers import (
     ImageEmbeddingProvider,
     get_image_embedding_provider,
 )
-from catalog_api.grouping import group_batch_task
+from catalog_api.grouping import (
+    group_batch_task,
+    record_group_batch_terminal_failure,
+)
 from catalog_api.models import (
     Category,
     ImageAsset,
@@ -347,7 +350,20 @@ def run_processing_batch(
             try:
                 group_batch_task(session, payload=payload)
             except Exception:
+                session.rollback()
                 logger.exception("Local grouping task failed.")
+                try:
+                    with session_factory() as failure_session:
+                        record_group_batch_terminal_failure(
+                            failure_session,
+                            payload=payload,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Unable to record terminal local grouping failure."
+                    )
+                    raise
+                return
 
     with session_factory() as session:
         ensure_classify_jobs_for_processed_images(

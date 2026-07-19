@@ -1,9 +1,10 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import ReviewBatch from "@/app/admin/review/[batchId]/review-batch";
 import {
+  ReviewBatchError,
   ReviewBatchGroups,
   ReviewCategory,
   approveReviewBatch,
@@ -13,27 +14,38 @@ import {
   loadReviewBatchGroups,
   mergeReviewGroups,
   moveReviewImage,
+  rejectReviewImage,
   reviewBatchAssetUrl,
+  restoreReviewImageRejection,
+  runMultimodalComparison,
   splitReviewGroup,
   updateReviewGroupCategory,
   updateReviewGroupCover,
   updateReviewImageDuplicate,
 } from "@/lib/review-batches";
 
-vi.mock("@/lib/review-batches", () => ({
-  approveReviewBatch: vi.fn(),
-  approveReviewGroup: vi.fn(),
-  createReviewGroup: vi.fn(),
-  loadReviewCategories: vi.fn(),
-  loadReviewBatchGroups: vi.fn(),
-  mergeReviewGroups: vi.fn(),
-  moveReviewImage: vi.fn(),
-  reviewBatchAssetUrl: vi.fn((path: string) => `http://api.test${path}`),
-  splitReviewGroup: vi.fn(),
-  updateReviewGroupCategory: vi.fn(),
-  updateReviewGroupCover: vi.fn(),
-  updateReviewImageDuplicate: vi.fn(),
-}));
+vi.mock("@/lib/review-batches", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/review-batches")>();
+  return {
+    ...actual,
+    approveReviewBatch: vi.fn(),
+    approveReviewGroup: vi.fn(),
+    createReviewGroup: vi.fn(),
+    loadReviewCategories: vi.fn(),
+    loadReviewBatchGroups: vi.fn(),
+    mergeReviewGroups: vi.fn(),
+    moveReviewImage: vi.fn(),
+    rejectReviewImage: vi.fn(),
+    reviewBatchAssetUrl: vi.fn((path: string) => `http://api.test${path}`),
+    restoreReviewImageRejection: vi.fn(),
+    runMultimodalComparison: vi.fn(),
+    splitReviewGroup: vi.fn(),
+    updateReviewGroupCategory: vi.fn(),
+    updateReviewGroupCover: vi.fn(),
+    updateReviewImageDuplicate: vi.fn(),
+  };
+});
 
 const approveReviewBatchMock = vi.mocked(approveReviewBatch);
 const approveReviewGroupMock = vi.mocked(approveReviewGroup);
@@ -42,7 +54,12 @@ const loadReviewCategoriesMock = vi.mocked(loadReviewCategories);
 const loadReviewBatchGroupsMock = vi.mocked(loadReviewBatchGroups);
 const mergeReviewGroupsMock = vi.mocked(mergeReviewGroups);
 const moveReviewImageMock = vi.mocked(moveReviewImage);
+const rejectReviewImageMock = vi.mocked(rejectReviewImage);
 const reviewBatchAssetUrlMock = vi.mocked(reviewBatchAssetUrl);
+const restoreReviewImageRejectionMock = vi.mocked(
+  restoreReviewImageRejection,
+);
+const runMultimodalComparisonMock = vi.mocked(runMultimodalComparison);
 const splitReviewGroupMock = vi.mocked(splitReviewGroup);
 const updateReviewGroupCategoryMock = vi.mocked(updateReviewGroupCategory);
 const updateReviewGroupCoverMock = vi.mocked(updateReviewGroupCover);
@@ -82,6 +99,8 @@ const reviewSnapshot: ReviewBatchGroups = {
       coverImageId: "image-1",
       suggestedCategorySlug: "t-shirts",
       approvedCategorySlug: null,
+      categorySuggestionStatus: "ready",
+      approvedCategorySource: "reviewer_cleared",
       possibleExistingProductId: null,
       warnings: [],
       images: [
@@ -92,6 +111,7 @@ const reviewSnapshot: ReviewBatchGroups = {
           thumbnailUrl: "/v1/upload-batches/batch-1/images/image-1/thumbnail",
           position: 0,
           isDuplicate: false,
+          isRejected: false,
           duplicateOfImageId: null,
           membershipSource: "engine",
           membershipConfidence: 0.94,
@@ -103,6 +123,7 @@ const reviewSnapshot: ReviewBatchGroups = {
           thumbnailUrl: "/v1/upload-batches/batch-1/images/image-2/thumbnail",
           position: 1,
           isDuplicate: true,
+          isRejected: false,
           duplicateOfImageId: "image-1",
           membershipSource: "exact_duplicate",
           membershipConfidence: 1,
@@ -116,6 +137,8 @@ const reviewSnapshot: ReviewBatchGroups = {
       coverImageId: "image-3",
       suggestedCategorySlug: null,
       approvedCategorySlug: "trousers",
+      categorySuggestionStatus: "unavailable",
+      approvedCategorySource: "reviewer_selection",
       possibleExistingProductId: "product-1",
       warnings: ["Possible variant of an existing item."],
       images: [
@@ -126,11 +149,27 @@ const reviewSnapshot: ReviewBatchGroups = {
           thumbnailUrl: "/v1/upload-batches/batch-1/images/image-3/thumbnail",
           position: 0,
           isDuplicate: false,
+          isRejected: false,
           duplicateOfImageId: null,
           membershipSource: "singleton",
           membershipConfidence: null,
         },
       ],
+    },
+  ],
+};
+
+const rejectedBackSnapshot: ReviewBatchGroups = {
+  ...reviewSnapshot,
+  groups: [
+    reviewSnapshot.groups[0],
+    {
+      ...reviewSnapshot.groups[1],
+      coverImageId: null,
+      images: reviewSnapshot.groups[1].images.map((image) => ({
+        ...image,
+        isRejected: true,
+      })),
     },
   ],
 };
@@ -144,12 +183,19 @@ describe("ReviewBatch", () => {
     loadReviewBatchGroupsMock.mockReset();
     mergeReviewGroupsMock.mockReset();
     moveReviewImageMock.mockReset();
+    rejectReviewImageMock.mockReset();
     reviewBatchAssetUrlMock.mockClear();
+    restoreReviewImageRejectionMock.mockReset();
+    runMultimodalComparisonMock.mockReset();
     splitReviewGroupMock.mockReset();
     updateReviewGroupCategoryMock.mockReset();
     updateReviewGroupCoverMock.mockReset();
     updateReviewImageDuplicateMock.mockReset();
     loadReviewCategoriesMock.mockResolvedValue(reviewCategories);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("renders a durable review snapshot with basic edit controls", async () => {
@@ -181,6 +227,9 @@ describe("ReviewBatch", () => {
       screen.getByText("Possible variant of an existing item."),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create group" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Run multimodal comparison" }),
+    ).toBeEnabled();
     expect(screen.getAllByRole("button", { name: "Approve group" })[0]).toBeDisabled();
     expect(screen.getAllByRole("button", { name: "Approve group" })[1]).toBeEnabled();
     expect(screen.getByRole("button", { name: "Approve batch" })).toBeDisabled();
@@ -208,6 +257,462 @@ describe("ReviewBatch", () => {
     expect(reviewBatchAssetUrlMock).toHaveBeenCalledWith(
       "/v1/upload-batches/batch-1/images/image-1/thumbnail",
     );
+  });
+
+  it("confirms multimodal comparison in an accessible modal dialog", async () => {
+    const user = userEvent.setup();
+    loadReviewBatchGroupsMock.mockResolvedValue(reviewSnapshot);
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    const comparisonAction = await screen.findByRole("button", {
+      name: "Run multimodal comparison",
+    });
+    await user.click(comparisonAction);
+
+    const dialog = screen.getByRole("dialog", {
+      name: "Run multimodal comparison?",
+    });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Run comparison" })).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(comparisonAction).toHaveFocus());
+
+    await user.click(comparisonAction);
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await waitFor(() => expect(comparisonAction).toHaveFocus());
+    expect(runMultimodalComparisonMock).not.toHaveBeenCalled();
+  });
+
+  it("confirms image rejection and replaces the snapshot without removing the image", async () => {
+    const user = userEvent.setup();
+    loadReviewBatchGroupsMock.mockResolvedValue(reviewSnapshot);
+    rejectReviewImageMock.mockResolvedValue(rejectedBackSnapshot);
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    await user.click(await screen.findByLabelText("Select back.jpg"));
+    const rejectionAction = screen.getByRole("button", {
+      name: "Reject back.jpg from export",
+    });
+    await user.click(rejectionAction);
+
+    const dialog = screen.getByRole("dialog", {
+      name: "Exclude this image from export?",
+    });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(
+      within(dialog).getByText(
+        "The image will remain in this review group and can be restored. It will not be included in future product export.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel" })).toHaveFocus();
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(rejectionAction).toHaveFocus());
+    expect(rejectReviewImageMock).not.toHaveBeenCalled();
+
+    await user.click(rejectionAction);
+    await user.click(screen.getByRole("button", { name: "Exclude image" }));
+
+    expect(rejectReviewImageMock).toHaveBeenCalledTimes(1);
+    expect(rejectReviewImageMock).toHaveBeenCalledWith("group-2", "image-3");
+    expect(await screen.findByText("Excluded from export")).toBeInTheDocument();
+    expect(screen.getByText("back.jpg")).toBeInTheDocument();
+    expect(screen.getByLabelText("Select back.jpg")).not.toBeChecked();
+    expect(
+      screen.getByRole("button", { name: "Restore back.jpg for export" }),
+    ).toBeEnabled();
+  });
+
+  it("restores a rejected image directly from the returned snapshot", async () => {
+    const user = userEvent.setup();
+    loadReviewBatchGroupsMock.mockResolvedValue(rejectedBackSnapshot);
+    restoreReviewImageRejectionMock.mockResolvedValue(reviewSnapshot);
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Restore back.jpg for export",
+      }),
+    );
+
+    expect(restoreReviewImageRejectionMock).toHaveBeenCalledTimes(1);
+    expect(restoreReviewImageRejectionMock).toHaveBeenCalledWith(
+      "group-2",
+      "image-3",
+    );
+    await waitFor(() => {
+      expect(screen.queryByText("Excluded from export")).not.toBeInTheDocument();
+    });
+    expect(
+      screen.getByRole("button", { name: "Reject back.jpg from export" }),
+    ).toBeEnabled();
+  });
+
+  it("renders duplicate dependency blocks for rejected images", async () => {
+    const dependencySnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: [
+        {
+          ...reviewSnapshot.groups[0],
+          coverImageId: null,
+          approvedCategorySlug: "t-shirts",
+          images: reviewSnapshot.groups[0].images.map((image) => ({
+            ...image,
+            isRejected: true,
+          })),
+        },
+        reviewSnapshot.groups[1],
+      ],
+    };
+    loadReviewBatchGroupsMock.mockResolvedValue(dependencySnapshot);
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    const restoreMaster = await screen.findByRole("button", {
+      name: "Restore front.jpg for export",
+    });
+    const restoreDuplicate = screen.getByRole("button", {
+      name: "Restore front-copy.jpg for export",
+    });
+    expect(restoreMaster).toBeEnabled();
+    expect(restoreDuplicate).toBeDisabled();
+    expect(
+      screen.getByText(
+        "Restore or replace the duplicate master before restoring this image for export.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("Excluded from export")).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "Approve group" })[0]).toBeDisabled();
+    expect(
+      screen.getByText(
+        "Restore at least one non-duplicate image before approving this group.",
+      ),
+    ).toBeInTheDocument();
+
+    const rejectedMasterCard = screen.getByText("front.jpg").closest("li");
+    expect(rejectedMasterCard).not.toBeNull();
+    expect(rejectedMasterCard).toHaveClass("image-card-rejected");
+    expect(
+      within(rejectedMasterCard as HTMLElement).queryByText("Set cover"),
+    ).not.toBeInTheDocument();
+
+  });
+
+  it("filters rejected images from duplicate master choices", async () => {
+    const filteredChoiceSnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: [
+        {
+          ...reviewSnapshot.groups[0],
+          coverImageId: "image-2",
+          images: reviewSnapshot.groups[0].images.map((image) =>
+            image.imageId === "image-1"
+              ? { ...image, isRejected: true }
+              : {
+                  ...image,
+                  isDuplicate: false,
+                  duplicateOfImageId: null,
+                },
+          ),
+        },
+        reviewSnapshot.groups[1],
+      ],
+    };
+    loadReviewBatchGroupsMock.mockResolvedValue(filteredChoiceSnapshot);
+    render(<ReviewBatch batchId="batch-1" />);
+
+    const duplicateMasterSelect = await screen.findByLabelText(
+      "Duplicate master for front-copy.jpg",
+    );
+    expect(
+      within(duplicateMasterSelect).queryByRole("option", {
+        name: "front.jpg",
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("disables rejection and every other mutation while rejection is pending", async () => {
+    const user = userEvent.setup();
+    let resolveRejection:
+      | ((snapshot: ReviewBatchGroups) => void)
+      | undefined;
+    loadReviewBatchGroupsMock.mockResolvedValue(reviewSnapshot);
+    rejectReviewImageMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRejection = resolve;
+        }),
+    );
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Reject back.jpg from export",
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Exclude image" }));
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select back.jpg")).toBeDisabled();
+      expect(
+        screen.getByRole("button", { name: "Restore duplicate" }),
+      ).toBeDisabled();
+      expect(
+        screen.getByRole("button", { name: "Run multimodal comparison" }),
+      ).toBeDisabled();
+    });
+
+    await act(async () => {
+      resolveRejection?.(rejectedBackSnapshot);
+    });
+    expect(
+      await screen.findByRole("button", {
+        name: "Restore back.jpg for export",
+      }),
+    ).toBeEnabled();
+  });
+
+  it("shows backend rejection errors without replacing the current snapshot", async () => {
+    const user = userEvent.setup();
+    loadReviewBatchGroupsMock.mockResolvedValue(reviewSnapshot);
+    rejectReviewImageMock.mockRejectedValue(
+      new ReviewBatchError(
+        "Restore or reassign active duplicates before rejecting their master.",
+        409,
+        "image_rejection_duplicate_master_in_use",
+      ),
+    );
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Reject back.jpg from export",
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Exclude image" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Restore or reassign active duplicates before rejecting their master.",
+    );
+    expect(screen.getByText("back.jpg")).toBeInTheDocument();
+    expect(screen.queryByText("Excluded from export")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Reject back.jpg from export" }),
+    ).toBeEnabled();
+  });
+
+  it("runs comparison, locks edits, and replaces the review snapshot", async () => {
+    const user = userEvent.setup();
+    let resolveComparison:
+      | ((snapshot: ReviewBatchGroups) => void)
+      | undefined;
+    const comparedSnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: [
+        {
+          ...reviewSnapshot.groups[0],
+          groupId: "compared-group",
+          images: [
+            ...reviewSnapshot.groups[0].images,
+            {
+              ...reviewSnapshot.groups[1].images[0],
+              position: 2,
+              membershipSource: "multimodal_model",
+            },
+          ],
+        },
+      ],
+    };
+    loadReviewBatchGroupsMock.mockResolvedValue(reviewSnapshot);
+    runMultimodalComparisonMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveComparison = resolve;
+        }),
+    );
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    const comparisonAction = await screen.findByRole("button", {
+      name: "Run multimodal comparison",
+    });
+    await user.click(comparisonAction);
+    await user.click(screen.getByRole("button", { name: "Run comparison" }));
+
+    expect(runMultimodalComparisonMock).toHaveBeenCalledWith("batch-1");
+    expect(
+      await screen.findByText(
+        "Multimodal comparison is running. This may take several minutes.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "Running multimodal comparison...",
+      }),
+    ).toBeDisabled();
+    expect(screen.getByLabelText("Select front.jpg")).toBeDisabled();
+    expect(screen.getAllByRole("button", { name: "Approve group" })[1]).toBeDisabled();
+
+    await act(async () => {
+      resolveComparison?.(comparedSnapshot);
+    });
+
+    expect(
+      await screen.findByText(
+        "Multimodal comparison completed. Review groups were refreshed.",
+      ),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("3 images")).toBeInTheDocument();
+    expect(screen.queryByText("1 image")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run multimodal comparison" })).toBeEnabled();
+    await waitFor(() => expect(comparisonAction).toHaveFocus());
+  });
+
+  it("clears pending review controls after a successful comparison no-op", async () => {
+    const user = userEvent.setup();
+    const editableSnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: [
+        {
+          ...reviewSnapshot.groups[0],
+          images: reviewSnapshot.groups[0].images.map((image) => ({
+            ...image,
+            isDuplicate: false,
+            duplicateOfImageId: null,
+          })),
+        },
+        reviewSnapshot.groups[1],
+      ],
+    };
+    loadReviewBatchGroupsMock.mockResolvedValue(editableSnapshot);
+    runMultimodalComparisonMock.mockResolvedValue(editableSnapshot);
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    await user.click(await screen.findByLabelText("Select front.jpg"));
+    await user.selectOptions(
+      screen.getByLabelText("Target group for back.jpg"),
+      "group-1",
+    );
+    await user.selectOptions(
+      screen.getByLabelText("Duplicate master for front.jpg"),
+      "image-2",
+    );
+    await user.selectOptions(
+      screen.getByLabelText("Approved category for Group 1"),
+      "category-t-shirts",
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Run multimodal comparison" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Run comparison" }));
+
+    expect(
+      await screen.findByText(
+        "Multimodal comparison completed. Review groups were refreshed.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Select front.jpg")).not.toBeChecked();
+    expect(screen.getByLabelText("Target group for back.jpg")).toHaveValue("");
+    expect(screen.getByLabelText("Duplicate master for front.jpg")).toHaveValue("");
+    expect(screen.getByLabelText("Approved category for Group 1")).toHaveValue("");
+  });
+
+  it("refreshes stale state once and retains comparison-not-allowed errors", async () => {
+    const user = userEvent.setup();
+    const refreshedSnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: [
+        {
+          ...reviewSnapshot.groups[0],
+          status: "approved",
+        },
+        reviewSnapshot.groups[1],
+      ],
+    };
+    loadReviewBatchGroupsMock
+      .mockResolvedValueOnce(reviewSnapshot)
+      .mockResolvedValueOnce(refreshedSnapshot);
+    runMultimodalComparisonMock.mockRejectedValue(
+      new ReviewBatchError(
+        "Multimodal comparison cannot run after review activity.",
+        409,
+        "multimodal_comparison_not_allowed",
+      ),
+    );
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Run multimodal comparison",
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Run comparison" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Multimodal comparison cannot run after review activity.",
+    );
+    await waitFor(() => {
+      expect(loadReviewBatchGroupsMock).toHaveBeenCalledTimes(2);
+    });
+    const comparisonAction = screen.getByRole("button", {
+      name: "Run multimodal comparison",
+    });
+    expect(comparisonAction).toHaveAttribute("aria-disabled", "true");
+    await waitFor(() => expect(comparisonAction).toHaveFocus());
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Multimodal comparison cannot run after review activity.",
+    );
+  });
+
+  it("keeps the current snapshot when stale-state refresh fails", async () => {
+    const user = userEvent.setup();
+    loadReviewBatchGroupsMock
+      .mockResolvedValueOnce(reviewSnapshot)
+      .mockRejectedValueOnce(new Error("Refresh failed."));
+    runMultimodalComparisonMock.mockRejectedValue(
+      new ReviewBatchError(
+        "Multimodal comparison cannot run after review activity.",
+        409,
+        "multimodal_comparison_not_allowed",
+      ),
+    );
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: "Run multimodal comparison",
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Run comparison" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Multimodal comparison cannot run after review activity.",
+    );
+    await waitFor(() => {
+      expect(loadReviewBatchGroupsMock).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.getByText("front.jpg")).toBeInTheDocument();
+    expect(screen.getByText("back.jpg")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Refresh failed.");
   });
 
   it("moves an image and replaces state with the server response", async () => {
@@ -243,6 +748,9 @@ describe("ReviewBatch", () => {
     expect(moveReviewImageMock).toHaveBeenCalledWith("group-1", "image-3");
     expect(await screen.findByText("3 images")).toBeInTheDocument();
     expect(screen.queryByText("1 image")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Run multimodal comparison" }),
+    ).toHaveAttribute("aria-disabled", "true");
   });
 
   it("creates a group from selected editable images in upload order", async () => {
@@ -445,6 +953,118 @@ describe("ReviewBatch", () => {
     await user.click(await screen.findByLabelText("Clear category for Group 2"));
 
     expect(updateReviewGroupCategoryMock).toHaveBeenLastCalledWith("group-2", null);
+  });
+
+  it("approves a machine-prefilled category without saving it first", async () => {
+    const user = userEvent.setup();
+    const machinePrefilledSnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: [
+        {
+          ...reviewSnapshot.groups[0],
+          approvedCategorySlug: "t-shirts",
+          approvedCategorySource: "machine_suggestion",
+          categorySuggestionStatus: "ready",
+        },
+        reviewSnapshot.groups[1],
+      ],
+    };
+    const approvedSnapshot: ReviewBatchGroups = {
+      ...machinePrefilledSnapshot,
+      groups: [
+        {
+          ...machinePrefilledSnapshot.groups[0],
+          status: "approved",
+          categorySuggestionStatus: null,
+        },
+        machinePrefilledSnapshot.groups[1],
+      ],
+    };
+    loadReviewBatchGroupsMock.mockResolvedValue(machinePrefilledSnapshot);
+    approveReviewGroupMock.mockResolvedValue(approvedSnapshot);
+
+    render(<ReviewBatch batchId="batch-1" />);
+
+    expect(
+      await screen.findByText("Prefilled from machine suggestion"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Approved category for Group 1"),
+    ).toHaveValue("category-t-shirts");
+
+    await user.click(
+      screen.getAllByRole("button", { name: "Approve group" })[0],
+    );
+
+    expect(approveReviewGroupMock).toHaveBeenCalledWith("group-1");
+    expect(updateReviewGroupCategoryMock).not.toHaveBeenCalled();
+    expect(
+      screen.queryByText("Prefilled from machine suggestion"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("polls pending category suggestions and recovers from a transient error", async () => {
+    vi.useFakeTimers();
+    const pendingSnapshot: ReviewBatchGroups = {
+      ...reviewSnapshot,
+      groups: [
+        {
+          ...reviewSnapshot.groups[0],
+          suggestedCategorySlug: null,
+          approvedCategorySlug: null,
+          categorySuggestionStatus: "pending",
+          approvedCategorySource: null,
+        },
+        reviewSnapshot.groups[1],
+      ],
+    };
+    const readySnapshot: ReviewBatchGroups = {
+      ...pendingSnapshot,
+      groups: [
+        {
+          ...pendingSnapshot.groups[0],
+          suggestedCategorySlug: "t-shirts",
+          approvedCategorySlug: "t-shirts",
+          categorySuggestionStatus: "ready",
+          approvedCategorySource: "machine_suggestion",
+        },
+        pendingSnapshot.groups[1],
+      ],
+    };
+    loadReviewBatchGroupsMock
+      .mockResolvedValueOnce(pendingSnapshot)
+      .mockRejectedValueOnce(new Error("Temporary polling failure."))
+      .mockResolvedValueOnce(readySnapshot);
+
+    render(<ReviewBatch batchId="batch-1" />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("pending")).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Temporary polling failure.",
+    );
+    expect(screen.getByText("pending")).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(loadReviewBatchGroupsMock).toHaveBeenCalledTimes(3);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Prefilled from machine suggestion"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Approved category for Group 1"),
+    ).toHaveValue("category-t-shirts");
   });
 
   it("shows stale approved categories and allows clearing them", async () => {
@@ -705,6 +1325,9 @@ describe("ReviewBatch", () => {
       expect(screen.getByLabelText("Select front.jpg")).toBeDisabled();
       expect(screen.getByRole("button", { name: "Saving..." })).toBeDisabled();
       expect(screen.getAllByRole("button", { name: "Move" })[2]).toBeDisabled();
+      expect(
+        screen.getByRole("button", { name: "Run multimodal comparison" }),
+      ).toBeDisabled();
     });
 
     resolveMove?.(reviewSnapshot);

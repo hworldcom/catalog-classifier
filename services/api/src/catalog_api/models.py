@@ -62,6 +62,11 @@ PAIR_ASSESSMENT_DECISIONS = (
     "different_product",
     "uncertain",
 )
+APPROVED_CATEGORY_SOURCES = (
+    "machine_suggestion",
+    "reviewer_selection",
+    "reviewer_cleared",
+)
 
 
 def _status_check(column_name: str, values: tuple[str, ...]) -> str:
@@ -623,6 +628,23 @@ class ProductGroup(Base):
             "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
             name="confidence_range",
         ),
+        CheckConstraint(
+            "approved_category_source IS NULL OR "
+            + _status_check(
+                "approved_category_source",
+                APPROVED_CATEGORY_SOURCES,
+            ),
+            name="approved_category_source",
+        ),
+        CheckConstraint(
+            "(approved_category_source IS NULL AND approved_category_id IS NULL) "
+            "OR approved_category_source = 'machine_suggestion' "
+            "OR (approved_category_source = 'reviewer_selection' "
+            "AND approved_category_id IS NOT NULL) "
+            "OR (approved_category_source = 'reviewer_cleared' "
+            "AND approved_category_id IS NULL)",
+            name="approved_category_source_consistency",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(
@@ -652,6 +674,10 @@ class ProductGroup(Base):
     approved_category_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("categories.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    approved_category_source: Mapped[str | None] = mapped_column(
+        String(32),
         nullable=True,
     )
     cover_image_id: Mapped[UUID | None] = mapped_column(
@@ -744,6 +770,11 @@ class ProductGroupImage(Base):
     membership_source: Mapped[str] = mapped_column(String(64), nullable=False)
     membership_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_duplicate: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+    )
+    is_rejected: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
         server_default=text("false"),

@@ -87,12 +87,15 @@ describe("ProcessingBatch", () => {
     expect(
       screen.queryByRole("img", { name: "Thumbnail for front.jpg" }),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Review groups" }),
+    ).not.toBeInTheDocument();
   });
 
   it("renders thumbnails after image processing completes", async () => {
     loadProcessingBatchMock.mockResolvedValue(
       processingSnapshot({
-        status: "processing",
+        status: "review_required",
         imageStatus: "processed",
         processJobStatus: "completed",
         classifyJobStatus: "completed",
@@ -115,13 +118,13 @@ describe("ProcessingBatch", () => {
     expect(screen.getByText("Thumbnail pending")).toBeInTheDocument();
   });
 
-  it("starts processing once, polls state, and renders completed classification", async () => {
+  it("starts processing once and exposes review after grouping completes", async () => {
     const user = userEvent.setup();
     loadProcessingBatchMock
       .mockResolvedValueOnce(processingSnapshot())
       .mockResolvedValueOnce(
         processingSnapshot({
-          status: "processing",
+          status: "review_required",
           imageStatus: "processed",
           processJobStatus: "completed",
           classifyJobStatus: "completed",
@@ -157,12 +160,16 @@ describe("ProcessingBatch", () => {
     expect(screen.getByText("0.95")).toBeInTheDocument();
     expect(screen.getAllByText("yes")).toHaveLength(2);
     expect(
-      screen.getByText("Processing reached terminal image states"),
+      screen.getByText("Review groups are ready"),
     ).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Review groups" })).toHaveAttribute(
+      "href",
+      "/admin/review/batch-1",
+    );
     expect(startUploadBatchProcessingMock).toHaveBeenCalledOnce();
   });
 
-  it("polls an already processing batch without calling start again", async () => {
+  it("keeps polling after image jobs become terminal until grouping completes", async () => {
     loadProcessingBatchMock
       .mockResolvedValueOnce(
         processingSnapshot({
@@ -182,22 +189,172 @@ describe("ProcessingBatch", () => {
           hasEmbedding: true,
           processedFileCount: 1,
         }),
+      )
+      .mockResolvedValueOnce(
+        processingSnapshot({
+          status: "review_required",
+          imageStatus: "processed",
+          processJobStatus: "completed",
+          classifyJobStatus: "completed",
+          categorySlug: "t-shirts",
+          confidence: 0.88,
+          hasHashes: true,
+          hasEmbedding: true,
+          processedFileCount: 1,
+        }),
       );
 
-    render(<ProcessingBatch batchId="batch-1" pollIntervalMs={1} />);
+    render(<ProcessingBatch batchId="batch-1" pollIntervalMs={100} />);
 
     expect(await screen.findByText("started")).toBeInTheDocument();
     await waitFor(() => {
       expect(loadProcessingBatchMock).toHaveBeenCalledTimes(2);
     });
+    expect(screen.getByText("Preparing review groups")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Image processing is complete. Preparing review groups...",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Review groups" }),
+    ).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(loadProcessingBatchMock).toHaveBeenCalledTimes(3);
+    });
     expect(await screen.findByText("t-shirts")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Review groups" })).toHaveAttribute(
+      "href",
+      "/admin/review/batch-1",
+    );
     expect(startUploadBatchProcessingMock).not.toHaveBeenCalled();
+  });
+
+  it("shows review navigation immediately for a review-ready batch", async () => {
+    loadProcessingBatchMock.mockResolvedValue(
+      processingSnapshot({
+        status: "review_required",
+        imageStatus: "processed",
+        processJobStatus: "completed",
+        classifyJobStatus: "failed",
+        classifyError: "category_suggestion_failed: Provider failed.",
+        processedFileCount: 1,
+      }),
+    );
+
+    render(<ProcessingBatch batchId="batch-1" pollIntervalMs={1} />);
+
+    expect(
+      await screen.findByRole("link", { name: "Review groups" }),
+    ).toHaveAttribute("href", "/admin/review/batch-1");
+    expect(
+      screen.getByText(
+        "Classify error: category_suggestion_failed: Provider failed.",
+      ),
+    ).toBeInTheDocument();
+    expect(loadProcessingBatchMock).toHaveBeenCalledOnce();
+  });
+
+  it("shows read-only review navigation for an approved batch", async () => {
+    loadProcessingBatchMock.mockResolvedValue(
+      processingSnapshot({
+        status: "approved",
+        imageStatus: "processed",
+        processJobStatus: "completed",
+        classifyJobStatus: "completed",
+        processedFileCount: 1,
+      }),
+    );
+
+    render(<ProcessingBatch batchId="batch-1" pollIntervalMs={1} />);
+
+    expect(
+      await screen.findByRole("link", { name: "View approved review" }),
+    ).toHaveAttribute("href", "/admin/review/batch-1");
+    expect(screen.getByText("Review is approved")).toBeInTheDocument();
+    expect(loadProcessingBatchMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [
+      "failed",
+      "Processing stopped before review groups could be prepared.",
+    ],
+    ["cancelled", "Processing was cancelled."],
+  ])(
+    "stops polling and hides review navigation for a %s batch",
+    async (status, message) => {
+      loadProcessingBatchMock.mockResolvedValue(
+        processingSnapshot({
+          status,
+          imageStatus: status === "failed" ? "failed" : "processed",
+          processJobStatus: "failed",
+        }),
+      );
+
+      render(<ProcessingBatch batchId="batch-1" pollIntervalMs={1} />);
+
+      expect(await screen.findByText(message)).toBeInTheDocument();
+      expect(
+        screen.queryByRole("link", { name: "Review groups" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("link", { name: "View approved review" }),
+      ).not.toBeInTheDocument();
+      expect(loadProcessingBatchMock).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("keeps the last snapshot and retries after a transient polling error", async () => {
+    loadProcessingBatchMock
+      .mockResolvedValueOnce(
+        processingSnapshot({
+          status: "processing",
+          imageStatus: "processed",
+          processJobStatus: "completed",
+          classifyJobStatus: "completed",
+          categorySlug: "trousers",
+          processedFileCount: 1,
+        }),
+      )
+      .mockRejectedValueOnce(new Error("Temporary polling failure."))
+      .mockResolvedValueOnce(
+        processingSnapshot({
+          status: "review_required",
+          imageStatus: "processed",
+          processJobStatus: "completed",
+          classifyJobStatus: "completed",
+          categorySlug: "trousers",
+          processedFileCount: 1,
+        }),
+      );
+
+    render(<ProcessingBatch batchId="batch-1" pollIntervalMs={100} />);
+
+    expect(await screen.findByText("trousers")).toBeInTheDocument();
+    expect(screen.getByText("Preparing review groups")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("alert", {}, { timeout: 500 }),
+    ).toHaveTextContent("Temporary polling failure.");
+    expect(screen.getByText("trousers")).toBeInTheDocument();
+
+    await waitFor(
+      () => {
+        expect(loadProcessingBatchMock).toHaveBeenCalledTimes(3);
+      },
+      { timeout: 700 },
+    );
+    expect(screen.getByRole("link", { name: "Review groups" })).toHaveAttribute(
+      "href",
+      "/admin/review/batch-1",
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("renders process and classify errors", async () => {
     loadProcessingBatchMock.mockResolvedValue(
       processingSnapshot({
-        status: "processing",
+        status: "review_required",
         processJobStatus: "completed",
         classifyJobStatus: "failed",
         classifyError: "category_suggestion_failed: Provider failed.",

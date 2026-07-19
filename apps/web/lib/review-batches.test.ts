@@ -9,7 +9,10 @@ import {
   loadReviewBatchGroups,
   mergeReviewGroups,
   moveReviewImage,
+  rejectReviewImage,
   reviewBatchAssetUrl,
+  restoreReviewImageRejection,
+  runMultimodalComparison,
   splitReviewGroup,
   updateReviewGroupCategory,
   updateReviewGroupCover,
@@ -86,7 +89,130 @@ describe("review batch client", () => {
         fetchMock as typeof fetch,
         "http://api.example.test/",
       ),
-    ).rejects.toEqual(new ReviewBatchError("Batch is not ready for review."));
+    ).rejects.toEqual(
+      new ReviewBatchError(
+        "Batch is not ready for review.",
+        409,
+        "batch_not_review_ready",
+      ),
+    );
+  });
+
+  it("runs multimodal comparison and retains structured backend errors", async () => {
+    const responseBody = {
+      batchId: "batch-1",
+      organizationId: "organization-1",
+      status: "review_required",
+      pipelineVersion: "2026-06-01",
+      groups: [],
+    };
+    const successFetch = vi.fn().mockResolvedValue(jsonResponse(responseBody));
+
+    await expect(
+      runMultimodalComparison(
+        "batch-1",
+        successFetch as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(responseBody);
+
+    expect(successFetch).toHaveBeenCalledWith(
+      "http://api.example.test/v1/upload-batches/batch-1/run-multimodal-comparison",
+      { method: "POST" },
+    );
+
+    const failedFetch = vi.fn().mockResolvedValue(
+      jsonResponse(
+        {
+          detail: {
+            code: "multimodal_comparison_not_allowed",
+            message: "Multimodal comparison cannot run after review activity.",
+          },
+        },
+        409,
+      ),
+    );
+
+    await expect(
+      runMultimodalComparison(
+        "batch-1",
+        failedFetch as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).rejects.toEqual(
+      new ReviewBatchError(
+        "Multimodal comparison cannot run after review activity.",
+        409,
+        "multimodal_comparison_not_allowed",
+      ),
+    );
+  });
+
+  it("rejects and restores review images through explicit action routes", async () => {
+    const responseBody = {
+      batchId: "batch-1",
+      organizationId: "organization-1",
+      status: "review_required",
+      pipelineVersion: "2026-06-01",
+      groups: [],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(responseBody))
+      .mockResolvedValueOnce(jsonResponse(responseBody))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            detail: {
+              code: "image_rejection_duplicate_master_in_use",
+              message: "Restore or reassign active duplicates first.",
+            },
+          },
+          409,
+        ),
+      );
+
+    await expect(
+      rejectReviewImage(
+        "group-1",
+        "image-1",
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(responseBody);
+    await expect(
+      restoreReviewImageRejection(
+        "group-1",
+        "image-1",
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).resolves.toEqual(responseBody);
+    await expect(
+      rejectReviewImage(
+        "group-1",
+        "image-1",
+        fetchMock as typeof fetch,
+        "http://api.example.test/",
+      ),
+    ).rejects.toEqual(
+      new ReviewBatchError(
+        "Restore or reassign active duplicates first.",
+        409,
+        "image_rejection_duplicate_master_in_use",
+      ),
+    );
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://api.example.test/v1/groups/group-1/images/image-1/reject",
+      { method: "POST" },
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://api.example.test/v1/groups/group-1/images/image-1/restore-rejection",
+      { method: "POST" },
+    );
   });
 
   it("sends review edit mutations", async () => {

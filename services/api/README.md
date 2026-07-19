@@ -613,6 +613,41 @@ The operation does not change image status, error fields, batch counts, or times
 Earlier Cloud Storage objects remain outside the current database references and are
 left for the later stale-object cleanup slice.
 
+## Approved Groups Export Prototype
+
+Ticket `0023` adds the read-only integration endpoint:
+
+```http
+GET /v1/upload-batches/{batchId}/approved-groups
+```
+
+The endpoint is disabled by default. Enable it locally with:
+
+```bash
+export CATALOG_APPROVED_GROUPS_EXPORT_ENABLED=true
+```
+
+This setting only enables the default-organization prototype. It is not
+authentication and must remain disabled in production until an authenticated,
+organization-aware service-to-service boundary exists.
+
+When disabled, the route returns
+`404 approved_groups_export_disabled` before looking up the batch. When enabled,
+it returns `404 batch_not_found` for an unknown batch,
+`409 batch_not_approved` for a non-approved batch, and `200` for an approved
+batch. An approved batch with no groups returns `groups: []`.
+
+The endpoint returns immutable approved group metadata and active,
+non-rejected memberships. It exposes classifier identifiers and category slugs,
+not storage keys or image URLs. Groups are ordered by creation time and group
+identifier. Images retain ascending source membership positions, including
+gaps left by omitted rejected memberships.
+
+The complete response is validated before it is returned. Missing required
+values, unapproved groups, invalid covers, or inconsistent duplicate references
+return `409 approved_groups_invalid` without a partial payload or database
+mutation.
+
 ## Validation
 
 Normal API tests do not require PostgreSQL:

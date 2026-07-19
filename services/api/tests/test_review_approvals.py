@@ -58,13 +58,33 @@ async def test_approve_review_group_logs_event_and_is_idempotent(
         assert stored_group.status == "approved"
         assert stored_group.approved_at is not None
         assert _review_event_actions(session, fixture.batch_id) == ["approve_group"]
+        approval_event = session.scalar(
+            select(ReviewEvent).where(
+                ReviewEvent.batch_id == fixture.batch_id,
+                ReviewEvent.action_type == "approve_group",
+            )
+        )
+        assert approval_event is not None
+        assert approval_event.payload_json == {
+            "groupId": str(stored_group.id),
+            "approvedCategoryId": str(stored_group.approved_category_id),
+            "approvedCategorySlug": "t-shirts",
+            "categorySource": "reviewer_selection",
+            "approvedAt": stored_group.approved_at.isoformat(),
+        }
         first_event_count = _review_event_count(session, fixture.batch_id)
 
     no_op_response = await database_client.post(
         f"/v1/groups/{fixture.group_ids[0]}/approve",
     )
+    rejection_response = await database_client.post(
+        f"/v1/groups/{fixture.group_ids[0]}/images/"
+        f"{fixture.image_ids[0]}/reject"
+    )
 
     assert no_op_response.status_code == 200
+    assert rejection_response.status_code == 409
+    assert rejection_response.json()["detail"]["code"] == "review_edit_not_allowed"
     with Session(migrated_engine) as session:
         assert _review_event_count(session, fixture.batch_id) == first_event_count
 
@@ -130,6 +150,10 @@ async def test_approve_review_batch_requires_approved_groups_then_locks_batch(
         f"/v1/groups/{fixture.group_ids[0]}",
         json={"coverImageId": str(fixture.image_ids[0])},
     )
+    rejection_response = await database_client.post(
+        f"/v1/groups/{fixture.group_ids[0]}/images/"
+        f"{fixture.image_ids[0]}/reject"
+    )
 
     assert read_response.status_code == 200
     assert read_response.json()["status"] == "approved"
@@ -137,6 +161,8 @@ async def test_approve_review_batch_requires_approved_groups_then_locks_batch(
     assert repeated_group_response.status_code == 200
     assert edit_response.status_code == 409
     assert edit_response.json()["detail"]["code"] == "review_edit_not_allowed"
+    assert rejection_response.status_code == 409
+    assert rejection_response.json()["detail"]["code"] == "review_edit_not_allowed"
     with Session(migrated_engine) as session:
         assert _review_event_count(session, fixture.batch_id) == first_event_count
 
@@ -167,6 +193,41 @@ async def test_approve_review_group_requires_approved_category(
         assert stored_group.status == "proposed"
         assert stored_group.approved_at is None
         assert _review_event_count(session, fixture.batch_id) == 0
+
+
+async def test_approve_review_group_requires_active_non_duplicate_image(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+) -> None:
+    with Session(migrated_engine) as session:
+        fixture = _create_review_approval_fixture(session, group_count=1)
+
+    reject_response = await database_client.post(
+        f"/v1/groups/{fixture.group_ids[0]}/images/"
+        f"{fixture.image_ids[0]}/reject"
+    )
+    approval_response = await database_client.post(
+        f"/v1/groups/{fixture.group_ids[0]}/approve",
+    )
+
+    assert reject_response.status_code == 200
+    rejected_group = _group_by_id(reject_response.json(), fixture.group_ids[0])
+    assert rejected_group["coverImageId"] is None
+    assert approval_response.status_code == 409
+    assert approval_response.json()["detail"] == {
+        "code": "review_approval_not_allowed",
+        "message": (
+            "Group approval requires at least one active non-duplicate image."
+        ),
+    }
+    with Session(migrated_engine) as session:
+        stored_group = session.get(ProductGroup, fixture.group_ids[0])
+        assert stored_group is not None
+        assert stored_group.status == "proposed"
+        assert stored_group.approved_at is None
+        assert _review_event_actions(session, fixture.batch_id) == [
+            "reject_image"
+        ]
 
 
 async def test_approve_review_batch_allows_empty_review_batch(
@@ -271,6 +332,9 @@ def _create_review_approval_fixture(
             status="proposed",
             suggested_category_id=category.id,
             approved_category_id=category.id if has_approved_category else None,
+            approved_category_source=(
+                "reviewer_selection" if has_approved_category else None
+            ),
             cover_image_id=image_id,
             confidence=1.0,
         )

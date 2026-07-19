@@ -108,11 +108,12 @@ button {
   cursor: pointer;
 }
 
-button:hover:not(:disabled) {
+button:hover:not(:disabled):not([aria-disabled="true"]) {
   background: var(--accent-hover);
 }
 
-button:disabled {
+button:disabled,
+button[aria-disabled="true"] {
   cursor: not-allowed;
   opacity: 0.5;
 }
@@ -124,7 +125,7 @@ button.secondary-action {
   color: var(--accent);
 }
 
-button.secondary-action:hover:not(:disabled) {
+button.secondary-action:hover:not(:disabled):not([aria-disabled="true"]) {
   background: #edf6f1;
 }
 
@@ -347,6 +348,23 @@ button.secondary-action:hover:not(:disabled) {
   padding-inline: 1rem;
 }
 
+.processing-review-link {
+  display: inline-flex;
+  min-height: 3rem;
+  align-items: center;
+  justify-content: center;
+  padding-inline: 1rem;
+  border-radius: 0.75rem;
+  background: var(--accent);
+  color: white;
+  font-weight: 750;
+  text-decoration: none;
+}
+
+.processing-review-link:hover {
+  background: var(--accent-hover);
+}
+
 .merge-toolbar {
   display: grid;
   grid-template-columns: minmax(12rem, 1fr) minmax(12rem, 16rem) minmax(12rem, 1fr) auto;
@@ -433,6 +451,83 @@ button.secondary-action:hover:not(:disabled) {
 
 .approval-toolbar button {
   min-width: 8rem;
+  padding-inline: 1rem;
+}
+
+.comparison-toolbar {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--card);
+}
+
+.comparison-toolbar div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.comparison-toolbar span {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.comparison-toolbar button {
+  min-width: 15rem;
+  padding-inline: 1rem;
+}
+
+.review-comparison-progress,
+.review-action-success {
+  margin: 0 0 1.5rem;
+}
+
+.comparison-dialog-backdrop {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  padding: 1.5rem;
+  place-items: center;
+  background: rgb(28 39 35 / 55%);
+}
+
+.comparison-dialog {
+  width: min(34rem, 100%);
+  padding: clamp(1.25rem, 4vw, 2rem);
+  border-radius: 1rem;
+  background: var(--card);
+  box-shadow: 0 1.5rem 4rem rgb(28 39 35 / 25%);
+}
+
+.comparison-dialog h2 {
+  margin: 0;
+}
+
+.comparison-dialog p {
+  margin: 1rem 0 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.comparison-dialog .rejection-dialog-filename {
+  color: var(--text);
+  font-weight: 800;
+}
+
+.comparison-dialog-actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: flex-end;
+  margin-top: 1.5rem;
+}
+
+.comparison-dialog-actions button {
+  min-width: 9rem;
   padding-inline: 1rem;
 }
 
@@ -573,6 +668,12 @@ button.secondary-action:hover:not(:disabled) {
   font-weight: 700;
 }
 
+.category-source-note {
+  color: #315e4b;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
 .category-actions {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -638,6 +739,16 @@ button.secondary-action:hover:not(:disabled) {
   border: 1px solid var(--border);
   border-radius: 0.75rem;
   background: white;
+}
+
+.image-card-rejected {
+  border-color: #c5cbc7;
+  background: #f4f5f3;
+}
+
+.image-card-rejected .thumbnail-link img {
+  opacity: 0.55;
+  filter: grayscale(25%);
 }
 
 .image-selection {
@@ -716,6 +827,12 @@ button.secondary-action:hover:not(:disabled) {
   color: #4d5f75;
 }
 
+.rejected-label {
+  width: fit-content;
+  background: #e2e4e1;
+  color: #4f5953;
+}
+
 .move-controls {
   display: grid;
   grid-template-columns: 1fr;
@@ -726,6 +843,17 @@ button.secondary-action:hover:not(:disabled) {
   display: grid;
   gap: 0.75rem;
   padding: 0 0.75rem 0.75rem;
+}
+
+.rejection-controls {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.image-action-note {
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.4;
 }
 
 .duplicate-controls {
@@ -886,6 +1014,18 @@ button.secondary-action:hover:not(:disabled) {
   }
 
   .approval-toolbar {
+    display: grid;
+  }
+
+  .comparison-toolbar {
+    display: grid;
+  }
+
+  .comparison-toolbar button {
+    width: 100%;
+  }
+
+  .comparison-dialog-actions {
     display: grid;
   }
 

@@ -13,6 +13,8 @@ from PIL import Image
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+import catalog_api.grouping as grouping_module
+import catalog_api.processing_orchestration as processing_orchestration_module
 from catalog_api.embedding_vectors import EMBEDDING_DIMENSIONS
 from catalog_api.image_embedding_providers import ImageEmbeddingProviderError
 from catalog_api.image_processing import JPEG_CONTENT_TYPE
@@ -21,8 +23,10 @@ from catalog_api.models import (
     ImageAsset,
     ImageClassification,
     ImageEmbedding,
+    PairAssessment,
     ProcessingJob,
     ProductGroup,
+    ProductGroupImage,
     UploadBatch,
 )
 from catalog_api.processing_orchestration import (
@@ -31,6 +35,8 @@ from catalog_api.processing_orchestration import (
     run_processing_batch,
 )
 from catalog_api.processing_jobs import (
+    CLASSIFY_IMAGE_JOB_TYPE,
+    GROUP_BATCH_JOB_TYPE,
     PROCESS_IMAGE_JOB_TYPE,
     process_image_idempotency_key,
 )
@@ -505,6 +511,117 @@ async def test_start_processing_runs_local_pipeline_and_creates_review_groups(
     assert embedding_count == 2
     assert classification_count == 2
     assert group_count == 1
+
+
+async def test_local_grouping_failure_rolls_back_and_marks_batch_failed(
+    database_client: AsyncClient,
+    migrated_engine: Engine,
+    fake_worker_storage: FakeWorkerStorage,
+    fake_image_embedding_provider: FakeImageEmbeddingProvider,
+    fake_category_suggestion_provider: FakeCategorySuggestionProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_bytes = _jpeg_bytes()
+    with Session(migrated_engine) as session:
+        batch_id, image_ids, object_keys = _create_batch_with_uploaded_images(
+            session,
+            image_count=2,
+        )
+    for object_key in object_keys:
+        fake_worker_storage.objects[object_key] = StoredObject(
+            data=original_bytes,
+            content_type=JPEG_CONTENT_TYPE,
+        )
+
+    original_persist_product_groups = grouping_module._persist_product_groups
+
+    def persist_groups_then_fail(
+        session: Session,
+        **kwargs: object,
+    ) -> None:
+        original_persist_product_groups(session, **kwargs)
+        session.flush()
+        raise RuntimeError("sensitive grouping diagnostic")
+
+    monkeypatch.setattr(
+        grouping_module,
+        "_persist_product_groups",
+        persist_groups_then_fail,
+    )
+    logged_exceptions: list[str] = []
+    monkeypatch.setattr(
+        processing_orchestration_module.logger,
+        "exception",
+        logged_exceptions.append,
+    )
+    runner = InlineProcessingRunner(
+        session_factory=sessionmaker(bind=migrated_engine),
+        storage=fake_worker_storage,
+        embedding_provider=fake_image_embedding_provider,
+        category_provider=fake_category_suggestion_provider,
+    )
+
+    with _override_processing_runner(runner):
+        response = await database_client.post(
+            f"/v1/upload-batches/{batch_id}/start-processing"
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failed"
+    assert logged_exceptions == ["Local grouping task failed."]
+
+    with Session(migrated_engine) as session:
+        batch = session.get(UploadBatch, batch_id)
+        group_job = session.scalar(
+            select(ProcessingJob).where(
+                ProcessingJob.batch_id == batch_id,
+                ProcessingJob.job_type == GROUP_BATCH_JOB_TYPE,
+            )
+        )
+        classify_jobs = session.scalars(
+            select(ProcessingJob).where(
+                ProcessingJob.batch_id == batch_id,
+                ProcessingJob.job_type == CLASSIFY_IMAGE_JOB_TYPE,
+            )
+        ).all()
+        pair_count = session.scalar(
+            select(func.count()).select_from(PairAssessment).where(
+                PairAssessment.batch_id == batch_id
+            )
+        )
+        group_count = session.scalar(
+            select(func.count()).select_from(ProductGroup).where(
+                ProductGroup.batch_id == batch_id
+            )
+        )
+        membership_count = session.scalar(
+            select(func.count()).select_from(ProductGroupImage).where(
+                ProductGroupImage.batch_id == batch_id
+            )
+        )
+        classification_count = session.scalar(
+            select(func.count()).select_from(ImageClassification).where(
+                ImageClassification.image_id.in_(image_ids)
+            )
+        )
+
+    assert batch is not None
+    assert batch.status == "failed"
+    assert group_job is not None
+    assert group_job.status == "failed"
+    assert group_job.completed_at is not None
+    assert (
+        group_job.error_message
+        == "grouping_failed: The grouping task could not be completed."
+    )
+    assert "sensitive grouping diagnostic" not in group_job.error_message
+    assert len(classify_jobs) == 2
+    assert all(job.status == "pending" for job in classify_jobs)
+    assert pair_count == 0
+    assert group_count == 0
+    assert membership_count == 0
+    assert classification_count == 0
 
 
 async def test_start_processing_creates_missing_classify_jobs_for_processed_images(
