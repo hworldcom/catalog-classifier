@@ -15,6 +15,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from catalog_api.approved_image_exports import (
+    ApprovedImageExportDisabledError,
+    ApprovedImageNotApprovedError,
+    ApprovedImageNotFoundError,
+    ApprovedImageUnavailableError,
+    read_approved_normalized_image,
+)
 from catalog_api.approved_group_exports import (
     ApprovedGroupsBatchNotFoundError,
     ApprovedGroupsBatchStateError,
@@ -657,6 +664,54 @@ def _approved_groups_invalid() -> HTTPException:
     )
 
 
+def _approved_image_export_disabled() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "code": "approved_image_export_disabled",
+            "message": "Approved image export is not enabled.",
+        },
+        headers=NO_STORE_HEADERS,
+    )
+
+
+def _approved_image_not_found() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "code": "approved_image_not_found",
+            "message": "Approved image was not found.",
+        },
+        headers=NO_STORE_HEADERS,
+    )
+
+
+def _approved_image_not_approved() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "approved_image_not_approved",
+            "message": (
+                "Approved image export requires an approved batch and group."
+            ),
+        },
+        headers=NO_STORE_HEADERS,
+    )
+
+
+def _approved_image_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "code": "approved_image_unavailable",
+            "message": (
+                "The approved normalized image is temporarily unavailable."
+            ),
+        },
+        headers=NO_STORE_HEADERS,
+    )
+
+
 def _review_edit_not_found(message: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
@@ -1283,6 +1338,49 @@ def get_durable_approved_groups_export(
         ) from error
 
     return _approved_groups_export_response(snapshot)
+
+
+@app.get(
+    "/internal/v1/export/batches/{batch_id}/groups/{group_id}/"
+    "images/{image_id}/normalized"
+)
+def get_approved_normalized_image_export(
+    batch_id: UUID,
+    group_id: UUID,
+    image_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+    storage: Annotated[WorkerStorage, Depends(get_worker_storage)],
+) -> Response:
+    try:
+        image = read_approved_normalized_image(
+            session,
+            batch_id=batch_id,
+            group_id=group_id,
+            image_id=image_id,
+            storage=storage,
+        )
+    except ApprovedImageExportDisabledError as error:
+        raise _approved_image_export_disabled() from error
+    except ApprovedImageNotFoundError as error:
+        raise _approved_image_not_found() from error
+    except ApprovedImageNotApprovedError as error:
+        raise _approved_image_not_approved() from error
+    except ApprovedImageUnavailableError as error:
+        raise _approved_image_unavailable() from error
+    except SQLAlchemyError as error:
+        session.rollback()
+        raise _upload_batch_database_error(
+            "Unable to load the approved image."
+        ) from error
+
+    return Response(
+        content=image.content,
+        media_type="image/jpeg",
+        headers={
+            **NO_STORE_HEADERS,
+            "Content-Length": str(image.content_length),
+        },
+    )
 
 
 @app.post(

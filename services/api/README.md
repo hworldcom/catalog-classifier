@@ -648,6 +648,41 @@ values, unapproved groups, invalid covers, or inconsistent duplicate references
 return `409 approved_groups_invalid` without a partial payload or database
 mutation.
 
+## Approved Normalized Image Export Prototype
+
+Ticket `0024a` adds the classifier-owned image endpoint consumed by the Bazoria
+backend:
+
+```http
+GET /internal/v1/export/batches/{batchId}/groups/{groupId}/images/{imageId}/normalized
+```
+
+The endpoint is disabled by default. Enable it locally with:
+
+```bash
+export CATALOG_APPROVED_IMAGE_EXPORT_ENABLED=true
+```
+
+This flag is not authentication. While application-level service authentication
+is deferred, enable the endpoint only for the default-organization prototype and
+only when network access is restricted to the Bazoria backend. Admin browsers
+must not call it directly.
+
+The endpoint returns normalized JPEG bytes only when:
+
+- the batch and group are approved;
+- the image is an active, non-rejected, non-duplicate group membership;
+- image processing completed;
+- normalized format and positive size metadata are present; and
+- the private storage object exists, is nonempty, and matches the recorded size.
+
+Successful responses include `Content-Type: image/jpeg`, an exact
+`Content-Length`, and `Cache-Control: no-store`. The endpoint never returns
+classifier object keys, bucket names, redirects, or signed URLs. It returns
+stable `404` errors for disabled, unknown, or ineligible requests; `409` when
+the batch or group is not approved; and `503` when normalized metadata or bytes
+are unavailable.
+
 ## Validation
 
 Normal API tests do not require PostgreSQL:

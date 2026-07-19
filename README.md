@@ -1253,10 +1253,13 @@ not approved returns `409 batch_not_approved`.
 The response contains the approved group category slugs, cover image identifier,
 confidence, and active non-rejected memberships in deterministic order. Each
 membership includes its classifier image identifier, position, and duplicate
-metadata. Ticket `0024` uses those identifiers with an authenticated
-server-to-server classifier image-read endpoint to transfer normalized JPEG
-bytes into Bazoria-owned storage. The classifier never exposes an object key,
-public URL, or browser-facing signed URL for this flow.
+metadata. Ticket `0024` uses those identifiers with a private server-to-server
+classifier image-read endpoint to transfer normalized JPEG
+bytes into Bazoria-owned storage. For the current prototype, application-level
+service authentication is deferred: ticket `0024a` keeps the route disabled by
+default, limited to the default organization, and suitable only for
+network-restricted access from the Bazoria backend. The classifier never
+exposes an object key, public URL, or browser-facing signed URL for this flow.
 
 `pipelineVersion`, `approvedCategorySlug`, and `coverImageId` are required in an
 approved export. `suggestedCategorySlug` and group `confidence` may be `null`.
@@ -1290,6 +1293,14 @@ Production use requires seller-to-organization mapping and a service-to-service
 authorization boundary. Until those exist, this endpoint is a local
 default-organization prototype only.
 
+Human access to the classifier admin pages is a separate Bazoria frontend
+authentication concern. An authenticated admin initiates import through the
+Bazoria backend; browsers never call approved-group or normalized-image export
+routes directly. Admin authentication does not authorize those server-to-server
+calls. Until service authentication is implemented, the normalized-image route
+must remain feature-gated and reachable only through restricted backend
+networking.
+
 Import flow:
 
 1. User approves the product group.
@@ -1299,11 +1310,31 @@ Import flow:
 4. Bazoria Web promotes that group's approved normalized images in ticket
    `0024`, then handles public publication later.
 
-Ticket `0024` uses one Bazoria image-promotion record per
+Ticket `0024a` adds the classifier route:
+
+```http
+GET /internal/v1/export/batches/{batchId}/groups/{groupId}/images/{imageId}/normalized
+```
+
+It returns only validated normalized JPEG bytes for an approved,
+non-rejected, non-duplicate membership. The route checks processed image state,
+normalized format and size metadata, and the actual object byte length. Missing
+or inconsistent normalized data is unavailable rather than falling back to the
+original upload or thumbnail.
+
+Ticket `0024b1` creates the durable Bazoria import run and ProductDraft source
+identity. Ticket `0024b2` uses one Bazoria image-promotion record per
 `(productDraftId, classifierImageId)` and a deterministic Bazoria storage key.
 A failed or pending required image leaves the ProductDraft incomplete and not
 eligible for publication; retries reuse the same draft, promotion record, and
-destination key.
+destination key. Bazoria creates the `pending` promotion record before writing
+the destination object. Promotion workers use an expiring attempt token and
+create-only object writes. On retry, Bazoria accepts an existing deterministic
+object only after verifying classifier source metadata, content type, and size
+against the trusted classifier response and promotion record. Destination
+metadata cannot attest to its own source length. An object written before a
+crash can therefore be recorded as promoted without copying it a second time or
+overwriting conflicting data.
 
 The initial import payload does not contain a product code, generated name,
 description, price, stock, sizes, or public image URL. Those are Bazoria-owned

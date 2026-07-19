@@ -854,9 +854,12 @@ Do not fill these fields from image classification alone:
 Those fields require seller input, human review, or a later explicit generation
 and review stage.
 
-## Future Approved-Group Export Contract
+## Approved-Group Export Contract
 
-This endpoint is recommended but not implemented yet:
+The local prototype implements this read-only endpoint when
+`CATALOG_APPROVED_GROUPS_EXPORT_ENABLED=true`. It remains disabled by default
+and is not production-ready until service-to-service organization authorization
+exists:
 
 ```http
 GET /v1/upload-batches/{batchId}/approved-groups
@@ -874,18 +877,15 @@ Recommended response shape:
     {
       "groupId": "uuid",
       "approvedCategorySlug": "t-shirts",
+      "suggestedCategorySlug": "t-shirts",
       "coverImageId": "uuid",
       "confidence": 0.94,
-      "warnings": [],
       "images": [
         {
           "imageId": "uuid",
-          "originalFilename": "front.jpg",
-          "originalObjectKey": "organizations/.../originals/...",
-          "thumbnailObjectKey": "organizations/.../thumbnails/...",
+          "position": 0,
           "isDuplicate": false,
-          "duplicateOfImageId": null,
-          "position": 0
+          "duplicateOfImageId": null
         }
       ]
     }
@@ -927,10 +927,38 @@ Website integration rules:
   Bazoria-owned storage;
 * Bazoria Web should own public image URLs and image lifecycle after promotion.
 
+Ticket `0024a` defines the feature-gated classifier source route:
+
+```http
+GET /internal/v1/export/batches/{batchId}/groups/{groupId}/images/{imageId}/normalized
+```
+
+The Bazoria backend calls this route; the admin browser does not. The prototype
+defers application-level service authentication and may be enabled only for the
+default organization when network access is restricted to the Bazoria backend.
+It returns validated normalized JPEG bytes and never exposes a classifier
+storage identifier.
+
+Ticket `0024b1` owns durable import runs, configured prototype seller mapping,
+ProductDraft source identity, and the Bazoria backend import start/status
+contracts. Ticket `0024b2` owns Bazoria image-promotion records, expiring
+attempt claims, create-only destination writes, source metadata verification,
+partial retries, cover assignment, and ProductDraft completeness. Existing
+destination objects are accepted only after comparison with a trusted classifier
+response and promotion record; destination metadata cannot attest to its own
+source length. Ticket `0024b3` adds the Bazoria admin interface for import
+progress, retry, and reconciliation.
+
 ## Authentication And Authorization
 
-The prototype has not completed production authentication for every path.
-Before connecting real seller data, production integration needs:
+The prototype intentionally postpones application-level service authentication.
+An authenticated admin may initiate import through Bazoria Web, but that browser
+session does not authorize classifier export requests. Until service
+authentication is implemented, export routes must remain disabled by default
+and reachable only over restricted backend networking.
+
+Before exposing classifier integration routes beyond that private prototype,
+production integration needs:
 
 * admin authentication for the classifier web app;
 * JSON Web Token (JWT) validation or equivalent on the classifier API;
@@ -1042,9 +1070,10 @@ payload instead of reading classifier internals.
 
 1. Keep classifier upload, processing, and review as an internal admin flow.
 2. Add production authentication and organization authorization.
-3. Add a dedicated approved-groups read endpoint.
+3. Use the local approved-groups read endpoint as the basis for a protected
+   production contract.
 4. Agree on the Bazoria `ProductDraft` schema and category mapping.
-5. Implement server-side ProductDraft export from approved classifier batches.
+5. Implement server-side ProductDraft import from approved classifier batches.
 6. Implement image promotion from classifier private storage to Bazoria public
    storage.
 7. Add Bazoria Web admin screens for imported product drafts.
@@ -1057,14 +1086,12 @@ The following decisions should be made before production integration:
 * exact seller-to-organization provisioning flow;
 * classifier API authentication mechanism;
 * whether Bazoria Web links to classifier admin or embeds the workflow;
-* approved-group export endpoint shape;
-* Bazoria ProductDraft schema;
+* protected production approved-group export access;
+* concrete Bazoria ProductDraft, image, audit, and promotion table mappings;
 * category mapping between classifier taxonomy and Bazoria taxonomy;
-* public image promotion strategy;
-* export retry and idempotency strategy;
+* Bazoria object-storage provider and its create-only write precondition;
 * how Bazoria Web surfaces classifier warnings;
 * whether review events should be imported into Bazoria Web;
-* image rejection semantics, currently deferred;
 * existing product matching semantics, still evolving.
 
 ## Minimal Contract For The Website Team
@@ -1075,12 +1102,12 @@ For the current milestone, the website team should assume this contract:
 Input:
   reviewed and approved classifier batch
 
-Available today:
-  GET /v1/upload-batches/{batchId}/groups
+Available in the local prototype when enabled:
+  GET /v1/upload-batches/{batchId}/approved-groups
   when batch status is approved
 
 Not production-ready yet:
-  dedicated approved-groups export endpoint
+  protected approved-groups export access
   automatic ProductDraft creation
   public image promotion
   production authentication and seller authorization
